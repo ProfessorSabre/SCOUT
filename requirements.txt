@@ -1,0 +1,58 @@
+# SCOUT environment, frozen from the actual working .venv on 2026-07-27.
+# Supersedes environment.yml (root), which is a stale personal Conda setup
+# from a previous machine and does not reflect this project's real
+# dependencies -- see Claude.md, .venv/ entry.
+#
+# IMPORTANT -- torch/torchvision below are CUDA 12.8 builds and are NOT on
+# the default PyPI index. Install them first from PyTorch's own index, THEN
+# install the rest of this file. See SETUP.md for the full walkthrough,
+# including the CPU-only alternative for machines without an NVIDIA GPU.
+
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+
+# --- Everything else installs normally from PyPI ---
+
+# Core: detection, tracking, and Re-ID
+ultralytics==8.4.95
+opencv-python==5.0.0.93
+lap==0.5.13          # linear assignment solver ByteTrack (via ultralytics) uses at runtime
+
+# Core: spatial calibration and data output
+pyproj==3.7.2
+pandas==3.0.3
+scipy==1.17.1        # Hungarian assignment (scipy.optimize.linear_sum_assignment) for MCMT fusion
+
+# Transitive dependencies (pulled in automatically by the packages above;
+# listed for exact reproducibility, not because they're used directly)
+certifi==2026.6.17
+charset-normalizer==3.4.9
+contourpy==1.3.3
+cycler==0.12.1
+filelock==3.29.0
+fonttools==4.63.0
+fsspec==2026.4.0
+idna==3.18
+Jinja2==3.1.6
+kiwisolver==1.5.0
+MarkupSafe==3.0.3
+matplotlib==3.11.0
+mpmath==1.3.0
+networkx==3.6.1
+numpy==2.4.4
+nvidia-ml-py==13.610.43
+packaging==26.2
+pillow==12.2.0
+polars==1.42.1
+polars-runtime-32==1.42.1
+psutil==7.2.2
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+requests==2.34.2
+six==1.17.0
+sympy==1.14.0
+typing_extensions==4.15.0
+tzdata==2026.3
+ultralytics-thop==2.0.20
+urllib3==2.7.0

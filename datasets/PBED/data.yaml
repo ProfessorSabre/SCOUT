@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 8
+names: ['bicycle', 'bus', 'golfcart', 'person', 'scooter', 'skateboard', 'vehicle', 'wheelchair']
+
+roboflow:
+  workspace: pbed-purdue-built-environment-database
+  project: siteanalyzer-9class
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/pbed-purdue-built-environment-database/siteanalyzer-9class/dataset/2

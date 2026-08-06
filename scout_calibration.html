@@ -1,0 +1,516 @@
+<title>SCOUT Calibration</title>
+<!--
+  SCOUT Phase 2 calibration tool. Single self-contained file, no backend:
+  works identically opened locally (double-click / file://) or hosted as a
+  static page. The only network dependency is Leaflet (CDN, for the map
+  library itself) and the live satellite tile imagery -- both are ordinary
+  HTTPS requests, the one thing even a locked-down machine's browser can
+  still do. Everything else (reading the local video file, drawing frames,
+  collecting clicks, building the output JSON) runs entirely client-side.
+
+  Output feeds homography_middleware.py's `calibrate-from-points` command.
+-->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px 0; }
+  .subtitle { color: #777; font-size: 0.85rem; margin-bottom: 16px; }
+
+  .id-row { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .id-row label { display: flex; flex-direction: column; font-size: 0.8rem; font-weight: 600; gap: 4px; }
+  .id-row input { font-size: 0.95rem; padding: 6px 8px; min-width: 220px; }
+
+  .status-bar { padding: 10px 14px; border-radius: 6px; background: #2b6cb0; color: white; font-weight: 600; margin-bottom: 12px; }
+  .status-bar.done { background: #2f855a; }
+
+  .panes { display: flex; gap: 16px; flex-wrap: wrap; }
+  .pane { flex: 1 1 480px; min-width: 320px; border: 1px solid #ccc; border-radius: 8px; padding: 10px; }
+  .pane h2 { font-size: 1rem; margin: 0 0 8px 0; }
+
+  #videoInput { margin-bottom: 8px; }
+  #videoEl { max-width: 100%; display: block; margin-bottom: 8px; }
+
+  .zoom-controls { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+  .zoom-controls button { padding: 4px 10px; cursor: pointer; font-size: 1rem; }
+  .zoom-label { font-size: 0.8rem; color: #777; min-width: 42px; }
+
+  .canvas-wrap { max-height: 480px; overflow: auto; border: 1px solid #999; margin-bottom: 6px; display: none; }
+  #frameCanvas { display: block; cursor: crosshair; }
+
+  #mapEl { width: 100%; height: 420px; border: 1px solid #999; }
+  #mapEl.awaiting-point-click { cursor: crosshair !important; }
+  #mapEl.awaiting-point-click .leaflet-interactive { cursor: crosshair !important; }
+  .map-search { display: flex; gap: 6px; margin-bottom: 8px; }
+  .map-search input { flex: 1; padding: 6px 8px; font-size: 0.9rem; }
+  .map-search button { padding: 6px 12px; cursor: pointer; }
+  .map-search-status { font-size: 0.78rem; color: #777; min-height: 1.1em; margin-top: 4px; }
+
+  .manual-toggle { font-size: 0.85rem; margin-top: 8px; }
+  .manual-entry { display: none; gap: 6px; margin-top: 6px; }
+  .manual-entry input { width: 110px; }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 0.85rem; }
+  th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: rgba(43,108,176,0.08); }
+  tbody tr.selected { background: rgba(43,108,176,0.22); }
+  button.remove { color: #c0392b; background: none; border: none; cursor: pointer; font-weight: 700; }
+
+  .footer-bar { margin-top: 16px; display: flex; align-items: center; gap: 12px; }
+  #pointCount { font-weight: 600; }
+  #finishBtn { padding: 10px 18px; font-size: 0.95rem; font-weight: 600; cursor: pointer; }
+  #finishBtn:disabled { cursor: not-allowed; opacity: 0.5; }
+
+  .grid-overlay-note { font-size: 0.75rem; color: #777; margin-top: 4px; }
+  .hint { font-size: 0.75rem; color: #777; margin-top: 4px; }
+</style>
+
+<h1>SCOUT Calibration</h1>
+<div class="subtitle">Click a point in the video, then click the same real-world location on the map. Repeat for at least 6 points, spread across the frame. Click a table row to jump to that point on both panes; drag an existing point to adjust it.</div>
+
+<div class="id-row">
+  <label>Site ID (permanent)
+    <input id="siteId" placeholder="e.g. site_001" />
+  </label>
+  <label>Camera ID (permanent)
+    <input id="cameraId" placeholder="e.g. cam_01" />
+  </label>
+</div>
+
+<div class="status-bar" id="statusBar">Enter a Site ID and Camera ID above, then load a video to begin.</div>
+
+<div class="panes">
+  <div class="pane">
+    <h2>1. Video frame</h2>
+    <input type="file" id="videoInput" accept="video/*" />
+    <video id="videoEl" controls></video>
+    <button id="captureBtn" disabled>Capture this frame</button>
+    <div class="zoom-controls">
+      <button id="zoomOutBtn" title="Zoom out">&minus;</button>
+      <button id="zoomFitBtn" title="Fit to pane">Fit</button>
+      <button id="zoomInBtn" title="Zoom in">+</button>
+      <span class="zoom-label" id="zoomLabel">100%</span>
+    </div>
+    <div class="canvas-wrap" id="canvasWrap">
+      <canvas id="frameCanvas"></canvas>
+    </div>
+    <div class="grid-overlay-note">Faint grid is just a coverage guide -- try to place points in multiple cells, not all clustered in one area.</div>
+    <div class="hint">Zoom in for precise clicks; once zoomed, click-and-drag empty space to pan around the frame. Drag an existing marker to nudge it.</div>
+  </div>
+
+  <div class="pane">
+    <h2>2. Map</h2>
+    <div class="map-search">
+      <input id="mapSearchInput" placeholder="Search for the site: a landmark, address, or place name" />
+      <button id="mapSearchBtn">Search</button>
+    </div>
+    <div class="map-search-status" id="mapSearchStatus"></div>
+    <div id="mapEl"></div>
+    <div class="hint">Zoom all the way in (scroll wheel or +/- controls) before clicking, for precision. Drag an existing pin to adjust it.</div>
+    <div class="manual-toggle">
+      <label><input type="checkbox" id="manualToggle" /> Enter coordinates manually instead (if map tiles won't load)</label>
+      <div class="manual-entry" id="manualEntry">
+        <input id="manualLat" placeholder="Latitude" />
+        <input id="manualLon" placeholder="Longitude" />
+        <button id="manualAddBtn">Use this point</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<table id="pointsTable">
+  <thead><tr><th>#</th><th>Video (x, y)</th><th>Latitude</th><th>Longitude</th><th></th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<div class="footer-bar">
+  <span id="pointCount">0 of 6 minimum points collected</span>
+  <button id="finishBtn" disabled>Finish &amp; Download calibration_points.json</button>
+</div>
+
+<script>
+const MIN_POINTS = 6;
+const HIT_RADIUS_CSS_PX = 14; // how close a click needs to be (in on-screen pixels) to grab an existing point instead of placing a new one
+const state = {
+  points: [],           // [{video_xy:[x,y], lat, lon}]
+  awaiting: 'video',    // 'video' | 'map'
+  pendingVideoXY: null,
+  selectedIndex: null,
+};
+
+const statusBar = document.getElementById('statusBar');
+const videoInput = document.getElementById('videoInput');
+const videoEl = document.getElementById('videoEl');
+const captureBtn = document.getElementById('captureBtn');
+const canvasWrap = document.getElementById('canvasWrap');
+const canvas = document.getElementById('frameCanvas');
+const ctx = canvas.getContext('2d');
+const zoomLabel = document.getElementById('zoomLabel');
+const pointCountEl = document.getElementById('pointCount');
+const finishBtn = document.getElementById('finishBtn');
+const tableBody = document.querySelector('#pointsTable tbody');
+const manualToggle = document.getElementById('manualToggle');
+const manualEntry = document.getElementById('manualEntry');
+
+function setStatus(text, done = false) {
+  statusBar.textContent = text;
+  statusBar.classList.toggle('done', done);
+}
+
+function refreshStatus() {
+  const n = state.points.length + 1;
+  if (state.awaiting === 'video') {
+    setStatus(`Point ${n}: click the location in the VIDEO frame.`);
+  } else {
+    setStatus(`Point ${n}: now click the SAME real-world location on the MAP (or use manual entry).`);
+  }
+  document.getElementById('mapEl').classList.toggle('awaiting-point-click', state.awaiting === 'map');
+}
+
+// --- Video loading + frame capture ---
+videoInput.addEventListener('change', () => {
+  const file = videoInput.files[0];
+  if (!file) return;
+  videoEl.src = URL.createObjectURL(file);
+  videoEl.style.display = 'block';
+  canvasWrap.style.display = 'none';
+  captureBtn.disabled = false;
+});
+
+captureBtn.addEventListener('click', () => {
+  canvas.width = videoEl.videoWidth;
+  canvas.height = videoEl.videoHeight;
+  ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+  drawCoverageGrid();
+  videoEl.style.display = 'none';
+  canvasWrap.style.display = 'block';
+  fitVideoZoom();
+  refreshStatus();
+});
+
+// --- Video zoom (native resolution never changes -- only the on-screen CSS
+// size does, so zooming in reveals real detail instead of upscaling a
+// downsampled image). A scrollable wrapper lets the user pan once zoomed in
+// past the pane's width. ---
+let videoZoom = 1;
+
+function applyVideoZoom() {
+  canvas.style.width = (canvas.width * videoZoom) + 'px';
+  canvas.style.height = (canvas.height * videoZoom) + 'px';
+  zoomLabel.textContent = Math.round(videoZoom * 100) + '%';
+}
+
+function fitVideoZoom() {
+  const wrapWidth = canvasWrap.clientWidth || 480;
+  videoZoom = canvas.width ? Math.min(1, wrapWidth / canvas.width) : 1;
+  applyVideoZoom();
+}
+
+document.getElementById('zoomInBtn').addEventListener('click', () => {
+  videoZoom = Math.min(videoZoom * 1.5, 8);
+  applyVideoZoom();
+});
+document.getElementById('zoomOutBtn').addEventListener('click', () => {
+  videoZoom = Math.max(videoZoom / 1.5, 0.1);
+  applyVideoZoom();
+});
+document.getElementById('zoomFitBtn').addEventListener('click', fitVideoZoom);
+
+function drawCoverageGrid() {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 3; i++) {
+    const x = (canvas.width / 3) * i;
+    const y = (canvas.height / 3) * i;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function redrawMarkers() {
+  ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+  drawCoverageGrid();
+  state.points.forEach((p, i) => drawVideoMarker(p.video_xy, i + 1, false, i === state.selectedIndex));
+  if (state.pendingVideoXY) drawVideoMarker(state.pendingVideoXY, state.points.length + 1, true, false);
+}
+
+function drawVideoMarker(xy, label, pending = false, selected = false) {
+  ctx.save();
+  ctx.fillStyle = pending ? 'orange' : (selected ? '#ffd400' : 'lime');
+  ctx.beginPath();
+  ctx.arc(xy[0], xy[1], selected ? 10 : 7, 0, 2 * Math.PI);
+  ctx.fill();
+  if (selected) { ctx.lineWidth = 2; ctx.strokeStyle = 'black'; ctx.stroke(); }
+  ctx.fillStyle = 'black';
+  ctx.font = 'bold 16px sans-serif';
+  ctx.fillText(String(label), xy[0] + 12, xy[1] - 12);
+  ctx.restore();
+}
+
+// --- Video canvas interaction ---
+// Three things can happen on empty (non-marker) canvas space, and which one
+// isn't known until the mouse comes back up: a plain click (place a new
+// point), or a click-and-drag (pan the zoomed frame -- there's no native
+// "grab to pan" on a <canvas> the way Leaflet gives the map, so it's built
+// here with a small movement threshold to distinguish the two). Mousedown
+// directly on an existing marker instead drags that point.
+let draggingPointIndex = null;
+let panState = null; // {startClientX, startClientY, startScrollLeft, startScrollTop, isPanning}
+const PAN_THRESHOLD_PX = 5;
+
+function canvasNativeCoords(e) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return { x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY, scaleX, scaleY };
+}
+
+function findPointNear(nativeX, nativeY, scaleX) {
+  const hitRadiusNative = HIT_RADIUS_CSS_PX * scaleX;
+  let bestIdx = null, bestDist = Infinity;
+  state.points.forEach((p, i) => {
+    const d = Math.hypot(p.video_xy[0] - nativeX, p.video_xy[1] - nativeY);
+    if (d <= hitRadiusNative && d < bestDist) { bestDist = d; bestIdx = i; }
+  });
+  return bestIdx;
+}
+
+// Idle hover-cursor feedback -- only while an actual gesture isn't underway,
+// so it doesn't fight with the drag/pan logic below.
+canvas.addEventListener('mousemove', (e) => {
+  if (draggingPointIndex !== null || panState) return;
+  const { x, y, scaleX } = canvasNativeCoords(e);
+  const hoverIdx = findPointNear(x, y, scaleX);
+  canvas.style.cursor = hoverIdx !== null ? 'grab' : 'crosshair';
+});
+
+canvas.addEventListener('mousedown', (e) => {
+  const { x, y, scaleX } = canvasNativeCoords(e);
+  const hitIdx = findPointNear(x, y, scaleX);
+  if (hitIdx !== null) {
+    draggingPointIndex = hitIdx;
+    canvas.style.cursor = 'grabbing';
+    return;
+  }
+  panState = {
+    startClientX: e.clientX, startClientY: e.clientY,
+    startScrollLeft: canvasWrap.scrollLeft, startScrollTop: canvasWrap.scrollTop,
+    isPanning: false,
+  };
+});
+
+// Active-gesture handling lives on window (not the canvas) so a fast drag
+// that briefly crosses the scrollbar or leaves the canvas bounds doesn't
+// get stuck mid-drag.
+window.addEventListener('mousemove', (e) => {
+  if (draggingPointIndex !== null) {
+    const { x, y } = canvasNativeCoords(e);
+    state.points[draggingPointIndex].video_xy = [Math.round(x), Math.round(y)];
+    redrawMarkers();
+    return;
+  }
+  if (panState) {
+    const dx = e.clientX - panState.startClientX;
+    const dy = e.clientY - panState.startClientY;
+    if (!panState.isPanning && Math.hypot(dx, dy) > PAN_THRESHOLD_PX) {
+      panState.isPanning = true;
+      canvas.style.cursor = 'grabbing';
+    }
+    if (panState.isPanning) {
+      canvasWrap.scrollLeft = panState.startScrollLeft - dx;
+      canvasWrap.scrollTop = panState.startScrollTop - dy;
+    }
+  }
+});
+
+window.addEventListener('mouseup', (e) => {
+  if (draggingPointIndex !== null) {
+    draggingPointIndex = null;
+    renderTable();
+    return;
+  }
+  if (panState) {
+    const wasPanning = panState.isPanning;
+    panState = null;
+    canvas.style.cursor = 'crosshair';
+    if (!wasPanning && state.awaiting === 'video') {
+      const { x, y } = canvasNativeCoords(e);
+      state.pendingVideoXY = [Math.round(x), Math.round(y)];
+      redrawMarkers();
+      state.awaiting = 'map';
+      refreshStatus();
+    }
+  }
+});
+
+// --- Map ---
+const map = L.map('mapEl', { maxZoom: 22 }).setView([20, 0], 2);
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+  attribution: 'Esri World Imagery',
+  maxZoom: 22,
+  maxNativeZoom: 19,
+}).addTo(map);
+// Raw satellite imagery has no place names, borders, or city context -- someone
+// who has never physically visited the site (increasingly the norm for remote
+// design work) can't orient on that alone. This reference layer overlays labels
+// and boundaries on top of the imagery, same standard Esri pairing used for this.
+// maxNativeZoom is set lower than the map's maxZoom deliberately -- without an
+// explicit maxZoom on the map itself, Leaflet caps the WHOLE map's zoom at the
+// lowest maxZoom among its layers, which silently prevented zooming in tight
+// enough on the imagery to click precisely.
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
+  attribution: 'Esri Boundaries & Places',
+  maxZoom: 22,
+  maxNativeZoom: 16,
+}).addTo(map);
+const mapMarkers = [];
+let searchResultMarker = null;
+
+map.on('click', (e) => {
+  if (state.awaiting !== 'map') return;
+  commitPoint(e.latlng.lat, e.latlng.lng);
+});
+
+// --- Map search (Nominatim/OpenStreetMap geocoding -- free, no API key).
+// Only fires on explicit search (button/Enter), never as-you-type, to stay
+// well within Nominatim's usage policy for a low-volume single-user tool.
+const mapSearchInput = document.getElementById('mapSearchInput');
+const mapSearchBtn = document.getElementById('mapSearchBtn');
+const mapSearchStatus = document.getElementById('mapSearchStatus');
+
+async function runMapSearch() {
+  const query = mapSearchInput.value.trim();
+  if (!query) return;
+  mapSearchStatus.textContent = 'Searching...';
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
+    const resp = await fetch(url);
+    const results = await resp.json();
+    if (!results.length) {
+      mapSearchStatus.textContent = `No results for "${query}". Try a more specific search, or pan/zoom manually.`;
+      return;
+    }
+    const r = results[0];
+    const bounds = [[parseFloat(r.boundingbox[0]), parseFloat(r.boundingbox[2])],
+                    [parseFloat(r.boundingbox[1]), parseFloat(r.boundingbox[3])]];
+    map.fitBounds(bounds);
+    if (searchResultMarker) map.removeLayer(searchResultMarker);
+    searchResultMarker = L.marker([parseFloat(r.lat), parseFloat(r.lon)]).addTo(map)
+      .bindPopup(r.display_name).openPopup();
+    mapSearchStatus.textContent = `Found: ${r.display_name}`;
+  } catch (err) {
+    mapSearchStatus.textContent = 'Search failed (network/blocked?). Pan and zoom manually instead.';
+  }
+}
+
+mapSearchBtn.addEventListener('click', runMapSearch);
+mapSearchInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); runMapSearch(); }
+});
+
+manualToggle.addEventListener('change', () => {
+  manualEntry.style.display = manualToggle.checked ? 'flex' : 'none';
+});
+
+document.getElementById('manualAddBtn').addEventListener('click', () => {
+  if (state.awaiting !== 'map') return;
+  const lat = parseFloat(document.getElementById('manualLat').value);
+  const lon = parseFloat(document.getElementById('manualLon').value);
+  if (Number.isNaN(lat) || Number.isNaN(lon)) { alert('Enter valid numeric latitude/longitude.'); return; }
+  commitPoint(lat, lon);
+  document.getElementById('manualLat').value = '';
+  document.getElementById('manualLon').value = '';
+});
+
+function commitPoint(lat, lon) {
+  const point = { video_xy: state.pendingVideoXY, lat, lon };
+  state.points.push(point);
+  const marker = L.marker([lat, lon], { draggable: true }).addTo(map)
+    .bindTooltip(String(state.points.length), { permanent: true });
+  marker.on('dragend', () => {
+    const idx = mapMarkers.indexOf(marker);
+    const ll = marker.getLatLng();
+    state.points[idx].lat = ll.lat;
+    state.points[idx].lon = ll.lng;
+    renderTable();
+  });
+  mapMarkers.push(marker);
+
+  state.pendingVideoXY = null;
+  state.awaiting = 'video';
+  redrawMarkers();
+  renderTable();
+  refreshStatus();
+}
+
+function selectPoint(idx) {
+  state.selectedIndex = idx;
+  const p = state.points[idx];
+  redrawMarkers();
+  renderTable();
+  const targetZoom = Math.max(map.getZoom(), 19);
+  map.setView([p.lat, p.lon], targetZoom);
+  mapMarkers[idx].openTooltip();
+}
+
+function renderTable() {
+  tableBody.innerHTML = '';
+  state.points.forEach((p, i) => {
+    const tr = document.createElement('tr');
+    tr.className = i === state.selectedIndex ? 'selected' : '';
+    tr.innerHTML = `<td>${i + 1}</td><td>${p.video_xy[0]}, ${p.video_xy[1]}</td>` +
+      `<td>${p.lat.toFixed(6)}</td><td>${p.lon.toFixed(6)}</td>` +
+      `<td><button class="remove" data-idx="${i}">remove</button></td>`;
+    tr.addEventListener('click', (e) => {
+      if (e.target.closest('button.remove')) return;
+      selectPoint(i);
+    });
+    tableBody.appendChild(tr);
+  });
+  document.querySelectorAll('button.remove').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = parseInt(btn.dataset.idx, 10);
+      state.points.splice(idx, 1);
+      map.removeLayer(mapMarkers[idx]);
+      mapMarkers.splice(idx, 1);
+      if (state.selectedIndex === idx) state.selectedIndex = null;
+      redrawMarkers();
+      renderTable();
+      updateFinishState();
+      refreshStatus();
+    });
+  });
+  updateFinishState();
+}
+
+function updateFinishState() {
+  const n = state.points.length;
+  pointCountEl.textContent = `${n} of ${MIN_POINTS} minimum points collected`;
+  finishBtn.disabled = n < MIN_POINTS;
+}
+
+finishBtn.addEventListener('click', () => {
+  const siteId = document.getElementById('siteId').value.trim();
+  const cameraId = document.getElementById('cameraId').value.trim();
+  if (!siteId || !cameraId) { alert('Enter a Site ID and Camera ID before downloading.'); return; }
+
+  const payload = {
+    site_id: siteId,
+    camera_id: cameraId,
+    captured_at: new Date().toISOString(),
+    points: state.points,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${siteId}__${cameraId}__calibration_points.json`;
+  a.click();
+  setStatus(`Downloaded ${state.points.length}-point calibration for ${siteId} / ${cameraId}. Run homography_middleware.py calibrate-from-points on it.`, true);
+});
+
+refreshStatus();
+</script>
