@@ -1,5 +1,7 @@
 # SCOUT — Spatial Context & Observation Utility Tool
 
+*This is the `main` branch: validated against this project's actual NVIDIA workstation + Jetson Orin Nano deployment target. If you're running different GPU hardware (AMD or Apple Silicon), the [`gpu-agnostic` branch](https://github.com/ProfessorSabre/SCOUT/tree/gpu-agnostic) auto-detects and supports those instead of assuming NVIDIA.*
+
 SCOUT is a computer-vision site-observation system built by the SPACE Lab (Spatial Prediction & Adaptive Contexts Engine), Purdue University Department of Horticulture and Landscape Architecture. It uses fixed, oblique-angle cameras to detect, track, and geolocate pedestrians and micro-mobility users (bicycles, scooters, skateboards, golf carts) in the built environment, producing timestamped, real-world-coordinate movement data for empirical site analysis, GIS, and design-simulation research.
 
 SCOUT is an **observation tool**, not a simulator. It answers "what actually happened at this site" from real video, as ground truth for downstream analysis (dwell time, route choice, occupancy) or for validating a separate simulation against reality. It does not generate predictions, run simulations, or infer behavior it didn't observe.
