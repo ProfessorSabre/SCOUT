@@ -1,5 +1,7 @@
 # SCOUT — Spatial Context & Observation Utility Tool
 
+*This is the `gpu-agnostic` branch: auto-detects NVIDIA (CUDA), AMD (ROCm/DirectML), and Apple Silicon (MPS) instead of assuming NVIDIA. If you're running the project's own NVIDIA workstation + Jetson Orin Nano deployment hardware, the [`main` branch](https://github.com/ProfessorSabre/SCOUT/tree/main) is the version actually validated against that setup.*
+
 SCOUT is a computer-vision site-observation system built by the SPACE Lab (Spatial Prediction & Adaptive Contexts Engine), Purdue University Department of Horticulture and Landscape Architecture. It uses fixed, oblique-angle cameras to detect, track, and geolocate pedestrians and micro-mobility users (bicycles, scooters, skateboards, golf carts) in the built environment, producing timestamped, real-world-coordinate movement data for empirical site analysis, GIS, and design-simulation research.
 
 SCOUT is an **observation tool**, not a simulator. It answers "what actually happened at this site" from real video, as ground truth for downstream analysis (dwell time, route choice, occupancy) or for validating a separate simulation against reality. It does not generate predictions, run simulations, or infer behavior it didn't observe.
@@ -27,7 +29,7 @@ frame_extraction_tools/    Video-to-frames utilities for building/expanding trai
 
 ## Getting started
 
-See [SETUP.md](SETUP.md) for environment setup (Python version, PyTorch/CUDA install, dependencies) and a quick smoke test.
+See [SETUP.md](SETUP.md) for environment setup (Python version, PyTorch install for your GPU vendor, dependencies) and a quick smoke test.
 
 Typical single-camera workflow, once set up:
 

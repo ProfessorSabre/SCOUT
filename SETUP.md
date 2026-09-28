@@ -5,7 +5,7 @@ This covers getting SCOUT running from a bare machine. For what the system does 
 ## Prerequisites
 
 - **Python 3.11.** SCOUT was built and tested against 3.11 specifically; other 3.x versions are untested.
-- **An NVIDIA GPU with CUDA 12.8-compatible drivers**, for real-time-capable detection/tracking/embedding speed. A CPU-only setup works (see below) but inference and Re-ID embedding extraction will be much slower — fine for a quick test, not for processing real footage at scale.
+- **A GPU is recommended** for real-time-capable detection/tracking/embedding speed. NVIDIA (CUDA), AMD (ROCm on Linux/WSL2; experimental DirectML on Windows), and Apple Silicon (MPS) are all supported. A CPU-only setup works too (see below) but inference and Re-ID embedding extraction will be much slower — fine for a quick test, not for processing real footage at scale.
 - **Windows or Linux.** This has only been run on Windows so far; paths in the codebase use `pathlib`/forward slashes throughout, so Linux should work but hasn't been verified.
 
 ## 1. Get the code
@@ -23,15 +23,43 @@ Activate it:
 - Windows (cmd): `.venv\Scripts\activate.bat`
 - Linux/macOS: `source .venv/bin/activate`
 
-## 3. Install PyTorch first, from PyTorch's own index
+## 3. Install PyTorch first, matching your hardware
 
-`requirements.txt` pins CUDA 12.8 builds of `torch`/`torchvision`, which are **not** on the default PyPI index — installing `requirements.txt` directly without this step will fail to resolve those two lines.
+`torch`/`torchvision` are not pinned in `requirements.txt` (see the comment there) because the correct build depends on your GPU vendor. Pick the section below that matches your hardware, then continue to step 4.
+
+### NVIDIA (CUDA)
+
+This is the hardware SCOUT has been developed and validated on.
 
 ```bash
 pip install torch==2.11.0+cu128 torchvision==0.26.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-**No NVIDIA GPU, or a different CUDA version?** Skip the pinned versions above and instead install whatever build matches your hardware from [pytorch.org's install selector](https://pytorch.org/get-started/locally/) — for CPU-only: `pip install torch torchvision`. Then remove the two `torch`/`torchvision` lines from `requirements.txt` before the next step, since they'd otherwise conflict.
+Requires CUDA 12.8-compatible drivers. For a different CUDA version, use [pytorch.org's install selector](https://pytorch.org/get-started/locally/) instead of the command above.
+
+### AMD (Linux / WSL2) — ROCm
+
+Mature, well-supported. Use [pytorch.org's install selector](https://pytorch.org/get-started/locally/), select Linux + ROCm, and run the command it gives you — a specific version isn't hardcoded here since ROCm's supported wheel tags change over time and a stale pinned command would be more misleading than useful. Not verified against this project's own test footage; if you hit issues, they're worth reporting.
+
+### AMD (Windows) — experimental / best-effort
+
+Native ROCm is not available on Windows. The best-effort path is [`torch-directml`](https://github.com/microsoft/DirectML), which routes PyTorch through Microsoft's DirectML rather than a vendor-native backend. This is **not** a fully supported or verified path here — expect rough edges, and expect some ops or performance characteristics to differ from CUDA/ROCm. If reliability matters more than convenience, WSL2 + the Linux/ROCm path above is the more mature option on the same machine.
+
+### Apple Silicon (MPS)
+
+```bash
+pip install torch torchvision
+```
+
+PyTorch's MPS backend is built into the standard macOS wheel — no special index needed. Not verified against this project's own test footage.
+
+### CPU-only (any platform)
+
+```bash
+pip install torch torchvision
+```
+
+Works everywhere but inference and Re-ID embedding extraction will be much slower — fine for a quick test, not for processing real footage at scale.
 
 ## 4. Install everything else
 
@@ -44,10 +72,10 @@ Everything past the `torch`/`torchvision` lines installs normally from PyPI — 
 ## 5. Verify the install
 
 ```bash
-python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('MPS available:', torch.backends.mps.is_available())"
 ```
 
-`CUDA available: True` confirms the GPU path is live. `False` means you're on CPU-only (expected if you followed the CPU-only branch in step 3, a problem otherwise).
+One of these should print `True` if you installed a GPU build in step 3 (`CUDA available` covers both NVIDIA and AMD/ROCm, since ROCm builds report through the same `torch.cuda` namespace; `MPS available` covers Apple Silicon). Both `False` means you're on CPU-only (expected if you followed the CPU-only branch in step 3, or the DirectML branch, which doesn't report through either flag, a problem otherwise).
 
 ## 6. Model weights
 
@@ -72,4 +100,4 @@ If you add or upgrade a package, regenerate the pin list from the real environme
 pip freeze
 ```
 
-...and update `requirements.txt` to match, keeping the `torch`/`torchvision`-first-with-its-own-index-URL note intact at the top.
+...and update `requirements.txt` to match, but strip the `torch==...`/`torchvision==...` lines back out before committing -- those stay unpinned here on purpose (see the comment at the top of `requirements.txt`), since the correct build is platform-specific and `pip freeze` will only capture whichever one happens to be installed on your machine.

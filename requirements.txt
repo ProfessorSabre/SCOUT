@@ -1,15 +1,13 @@
-# SCOUT environment, frozen from the actual working .venv on 2026-07-27.
-# Supersedes environment.yml (root), which is a stale personal Conda setup
-# from a previous machine and does not reflect this project's real
-# dependencies -- see Claude.md, .venv/ entry.
+# SCOUT environment (gpu-agnostic branch), frozen from the working .venv
+# used to validate this project, with torch/torchvision unpinned -- see below.
 #
-# IMPORTANT -- torch/torchvision below are CUDA 12.8 builds and are NOT on
-# the default PyPI index. Install them first from PyTorch's own index, THEN
-# install the rest of this file. See SETUP.md for the full walkthrough,
-# including the CPU-only alternative for machines without an NVIDIA GPU.
-
-torch==2.11.0+cu128
-torchvision==0.26.0+cu128
+# torch/torchvision are intentionally NOT pinned here. The correct build is
+# vendor- and platform-specific (NVIDIA/CUDA, AMD/ROCm on Linux, AMD/DirectML
+# on Windows, Apple Silicon/MPS, or CPU-only), and no single pin installs
+# correctly across all of them -- a CUDA-tagged wheel simply isn't resolvable
+# by pip on a machine without that CUDA build available. Install
+# torch/torchvision FIRST, following the platform-specific instructions in
+# SETUP.md, THEN install the rest of this file.
 
 # --- Everything else installs normally from PyPI ---
 
@@ -40,7 +38,7 @@ matplotlib==3.11.0
 mpmath==1.3.0
 networkx==3.6.1
 numpy==2.4.4
-nvidia-ml-py==13.610.43
+nvidia-ml-py==13.610.43  # unused transitive dep of ultralytics (pure-Python metadata pkg, not a native NVIDIA binary -- harmless to install on any platform)
 packaging==26.2
 pillow==12.2.0
 polars==1.42.1

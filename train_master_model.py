@@ -11,8 +11,10 @@ def main():
     # 5090, 24GB) -- neither assumption carries over automatically. 16 is a
     # reasonable starting point (2x the VRAM roughly offsetting the bigger
     # model), but it hasn't been empirically verified on this GPU/model combo
-    # yet. Watch for OOM on the first run and adjust; don't trust this number
-    # blindly.
+    # yet, and batch size will need retuning again on hardware with a
+    # different memory budget (AMD/Apple Silicon memory sizes vary
+    # independently of this history). Watch for OOM on the first run and
+    # adjust; don't trust this number blindly on any GPU.
     results = model.train(
         data="datasets/PBED/data.yaml",
         epochs=50,
@@ -23,7 +25,10 @@ def main():
         # and hasn't been discussed. Revisit if V3 accuracy disappoints.
         imgsz=640,
         batch=16,
-        device=0,
+        # No explicit device= here: Ultralytics auto-selects cuda -> mps ->
+        # cpu when omitted, matching run_inference.py's model.track() call,
+        # which already relies on the same auto-selection to stay
+        # vendor-agnostic rather than hardcoding a CUDA device index.
         project="Site_Analyzer_Runs",
         name="master_7class_v3"  # 7 classes as of the wheelchair-removal decision, not 9
     )

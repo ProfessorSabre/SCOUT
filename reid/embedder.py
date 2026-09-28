@@ -23,7 +23,11 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 class PersonEmbedder:
     def __init__(self, weights_path: Path = WEIGHTS_PATH, device: str | None = None):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or (
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
+        )
         self.model = osnet_ain_x1_0(num_classes=NUM_CLASSES_IN_CHECKPOINT, pretrained=False)
 
         checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
