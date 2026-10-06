@@ -47,6 +47,13 @@
   .map-search button { padding: 6px 12px; cursor: pointer; }
   .map-search-status { font-size: 0.78rem; color: #777; min-height: 1.1em; margin-top: 4px; }
 
+  .imagery-row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; font-size: 0.85rem; }
+  .imagery-row select { padding: 4px 6px; font-size: 0.85rem; max-width: 100%; }
+  .custom-imagery { display: none; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; align-items: center; font-size: 0.8rem; }
+  .custom-imagery input[type=text] { flex: 1 1 320px; padding: 5px 7px; font-size: 0.8rem; }
+  .custom-imagery input[type=number] { width: 56px; padding: 4px; }
+  .load-row { font-size: 0.8rem; display: flex; flex-direction: column; gap: 4px; font-weight: 600; }
+
   .manual-toggle { font-size: 0.85rem; margin-top: 8px; }
   .manual-entry { display: none; gap: 6px; margin-top: 6px; }
   .manual-entry input { width: 110px; }
@@ -77,14 +84,18 @@
   <label>Camera ID (permanent)
     <input id="cameraId" placeholder="e.g. cam_01" />
   </label>
+  <div class="load-row">Resume from a saved calibration (optional)
+    <input type="file" id="pointsInput" accept=".json,application/json" />
+  </div>
 </div>
 
-<div class="status-bar" id="statusBar">Enter a Site ID and Camera ID above, then load a video to begin.</div>
+<div class="status-bar" id="statusBar">Enter a Site ID and Camera ID above, then load a video (or a still frame) to begin.</div>
 
 <div class="panes">
   <div class="pane">
     <h2>1. Video frame</h2>
-    <input type="file" id="videoInput" accept="video/*" />
+    <input type="file" id="videoInput" accept="video/*,image/*" />
+    <div class="hint">A still frame (PNG/JPG) works too -- useful when the browser can't play the video's codec (e.g. iPhone HEVC).</div>
     <video id="videoEl" controls></video>
     <button id="captureBtn" disabled>Capture this frame</button>
     <div class="zoom-controls">
@@ -107,6 +118,16 @@
       <button id="mapSearchBtn">Search</button>
     </div>
     <div class="map-search-status" id="mapSearchStatus"></div>
+    <div class="imagery-row">
+      <label for="imagerySelect">Aerial imagery:</label>
+      <select id="imagerySelect"></select>
+      <label><input type="checkbox" id="labelsToggle" checked /> place labels</label>
+    </div>
+    <div class="custom-imagery" id="customImagery">
+      <input type="text" id="customImageryUrl" placeholder="Tile URL with {z}/{x}/{y}, or an ArcGIS .../MapServer or .../ImageServer URL" />
+      <label>max native zoom <input type="number" id="customImageryMaxZoom" value="20" min="10" max="23" /></label>
+      <button id="customImageryApply">Use</button>
+    </div>
     <div id="mapEl"></div>
     <div class="hint">Zoom all the way in (scroll wheel or +/- controls) before clicking, for precision. Drag an existing pin to adjust it.</div>
     <div class="manual-toggle">
@@ -170,25 +191,48 @@ function refreshStatus() {
 }
 
 // --- Video loading + frame capture ---
+// Whatever the captured frame is drawn from: the <video> element, or a still
+// image loaded directly. Points are pixel coordinates either way, so a still
+// exported at the video's native resolution calibrates identically.
+let frameSource = videoEl;
+let loadedFrameName = null;
+
 videoInput.addEventListener('change', () => {
   const file = videoInput.files[0];
   if (!file) return;
-  videoEl.src = URL.createObjectURL(file);
+  loadedFrameName = file.name;
+  const url = URL.createObjectURL(file);
+  if (file.type.startsWith('image/')) {
+    const img = new Image();
+    img.onload = () => {
+      frameSource = img;
+      videoEl.style.display = 'none';
+      captureBtn.disabled = true;
+      showCapturedFrame(img.naturalWidth, img.naturalHeight);
+    };
+    img.src = url;
+    return;
+  }
+  frameSource = videoEl;
+  videoEl.src = url;
   videoEl.style.display = 'block';
   canvasWrap.style.display = 'none';
   captureBtn.disabled = false;
 });
 
 captureBtn.addEventListener('click', () => {
-  canvas.width = videoEl.videoWidth;
-  canvas.height = videoEl.videoHeight;
-  ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
-  drawCoverageGrid();
+  showCapturedFrame(videoEl.videoWidth, videoEl.videoHeight);
+});
+
+function showCapturedFrame(width, height) {
+  canvas.width = width;
+  canvas.height = height;
+  redrawMarkers(); // draws the frame, the grid, and any points already loaded from a saved file
   videoEl.style.display = 'none';
   canvasWrap.style.display = 'block';
   fitVideoZoom();
   refreshStatus();
-});
+}
 
 // --- Video zoom (native resolution never changes -- only the on-screen CSS
 // size does, so zooming in reveals real detail instead of upscaling a
@@ -232,7 +276,7 @@ function drawCoverageGrid() {
 }
 
 function redrawMarkers() {
-  ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(frameSource, 0, 0, canvas.width, canvas.height);
   drawCoverageGrid();
   state.points.forEach((p, i) => drawVideoMarker(p.video_xy, i + 1, false, i === state.selectedIndex));
   if (state.pendingVideoXY) drawVideoMarker(state.pendingVideoXY, state.points.length + 1, true, false);
@@ -349,24 +393,119 @@ window.addEventListener('mouseup', (e) => {
 
 // --- Map ---
 const map = L.map('mapEl', { maxZoom: 22 }).setView([20, 0], 2);
-L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-  attribution: 'Esri World Imagery',
-  maxZoom: 22,
-  maxNativeZoom: 19,
-}).addTo(map);
-// Raw satellite imagery has no place names, borders, or city context -- someone
-// who has never physically visited the site (increasingly the norm for remote
-// design work) can't orient on that alone. This reference layer overlays labels
-// and boundaries on top of the imagery, same standard Esri pairing used for this.
-// maxNativeZoom is set lower than the map's maxZoom deliberately -- without an
-// explicit maxZoom on the map itself, Leaflet caps the WHOLE map's zoom at the
-// lowest maxZoom among its layers, which silently prevented zooming in tight
-// enough on the imagery to click precisely.
-L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
+
+// Calibration accuracy is capped by how sharply the aerial imagery shows the
+// ground, so the source is selectable. Without an explicit maxZoom on the map
+// itself, Leaflet caps the WHOLE map at the lowest maxZoom among its layers;
+// each layer instead sets maxNativeZoom (the deepest zoom the source really
+// has) and Leaflet enlarges that level beyond it.
+//
+// maxNativeZoom has to be honest per source: Esri answers zoom levels it has
+// no imagery for with a gray "Map data not yet available" tile (HTTP 200, so
+// Leaflet can't detect it and fall back), which is why the global default
+// stops at 19 and a separate "high detail" entry goes to 20.
+
+// Many state/county orthophoto services (ArcGIS MapServer/ImageServer) have
+// no pre-cut tile cache, only on-demand export. This requests one exported
+// image per map tile, which works with any of them at any zoom.
+const WEB_MERCATOR_HALF = 20037508.342789244;
+const ArcGISExportLayer = L.TileLayer.extend({
+  initialize(serviceUrl, options) {
+    this._serviceUrl = serviceUrl.replace(/\/+$/, '');
+    this._isImageServer = /\/ImageServer$/i.test(this._serviceUrl);
+    L.TileLayer.prototype.initialize.call(this, '', options);
+  },
+  getTileUrl(coords) {
+    const size = 2 * WEB_MERCATOR_HALF / Math.pow(2, coords.z);
+    const xmin = -WEB_MERCATOR_HALF + coords.x * size;
+    const ymax = WEB_MERCATOR_HALF - coords.y * size;
+    const bbox = `${xmin},${ymax - size},${xmin + size},${ymax}`;
+    const op = this._isImageServer ? 'exportImage' : 'export';
+    const fmt = this._isImageServer ? 'jpgpng' : 'jpg';
+    return `${this._serviceUrl}/${op}?bbox=${bbox}&bboxSR=3857&imageSR=3857&size=256,256&format=${fmt}&f=image`;
+  },
+});
+
+const IMAGERY_SOURCES = [
+  { id: 'esri', label: 'Esri World Imagery (global)', attribution: 'Esri World Imagery', maxNativeZoom: 19,
+    make: o => L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', o) },
+  { id: 'esri-z20', label: 'Esri World Imagery, high detail (where available)', attribution: 'Esri World Imagery', maxNativeZoom: 20,
+    make: o => L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', o) },
+  { id: 'esri-clarity', label: 'Esri World Imagery Clarity (different capture date)', attribution: 'Esri World Imagery (Clarity)', maxNativeZoom: 19,
+    make: o => L.tileLayer('https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', o) },
+  { id: 'indiana', label: 'Indiana statewide orthophotos, 3-6 in. (IGIO, Indiana only)', attribution: 'Indiana Geographic Information Office orthoimagery (CC0)', maxNativeZoom: 22,
+    make: o => new ArcGISExportLayer('https://di-ingov.img.arcgis.com/arcgis/rest/services/DynamicWebMercator/Indiana_Current_Imagery/ImageServer', o) },
+  { id: 'custom', label: 'Custom imagery service...' },
+];
+
+const imagerySelect = document.getElementById('imagerySelect');
+const customImagery = document.getElementById('customImagery');
+const customImageryUrl = document.getElementById('customImageryUrl');
+const customImageryMaxZoom = document.getElementById('customImageryMaxZoom');
+IMAGERY_SOURCES.forEach(s => imagerySelect.add(new Option(s.label, s.id)));
+
+// Per-viewer convenience only (last source + custom URL); the tool works the
+// same without it.
+const prefs = {
+  get(key) { try { return localStorage.getItem('scoutCalibration.' + key); } catch { return null; } },
+  set(key, value) { try { localStorage.setItem('scoutCalibration.' + key, value); } catch { /* storage unavailable */ } },
+};
+
+let imageryLayer = null;
+let currentImagery = { id: 'esri', label: IMAGERY_SOURCES[0].label, url: null };
+
+function useImagery(id) {
+  const opts = { maxZoom: 22 };
+  let layer;
+  if (id === 'custom') {
+    const url = customImageryUrl.value.trim();
+    if (!url) { customImagery.style.display = 'flex'; return; }
+    opts.maxNativeZoom = parseInt(customImageryMaxZoom.value, 10) || 20;
+    opts.attribution = 'Custom imagery';
+    layer = /\{z\}/i.test(url) ? L.tileLayer(url, opts) : new ArcGISExportLayer(url, opts);
+    currentImagery = { id, label: 'Custom', url, maxNativeZoom: opts.maxNativeZoom };
+    prefs.set('customUrl', url);
+    prefs.set('customMaxZoom', String(opts.maxNativeZoom));
+  } else {
+    const src = IMAGERY_SOURCES.find(s => s.id === id) || IMAGERY_SOURCES[0];
+    opts.maxNativeZoom = src.maxNativeZoom;
+    opts.attribution = src.attribution;
+    layer = src.make(opts);
+    currentImagery = { id: src.id, label: src.label, url: null };
+  }
+  if (imageryLayer) map.removeLayer(imageryLayer);
+  imageryLayer = layer.addTo(map);
+  imageryLayer.bringToBack();
+  prefs.set('imagery', id);
+}
+
+imagerySelect.addEventListener('change', () => {
+  customImagery.style.display = imagerySelect.value === 'custom' ? 'flex' : 'none';
+  useImagery(imagerySelect.value);
+});
+document.getElementById('customImageryApply').addEventListener('click', () => useImagery('custom'));
+
+// Raw imagery has no place names, borders, or city context -- someone who has
+// never visited the site can't orient on it alone -- so a labels/boundaries
+// reference layer sits on top, toggleable since it can hide the very ground
+// features being clicked.
+const labelsLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
   attribution: 'Esri Boundaries & Places',
   maxZoom: 22,
   maxNativeZoom: 16,
 }).addTo(map);
+document.getElementById('labelsToggle').addEventListener('change', (e) => {
+  if (e.target.checked) labelsLayer.addTo(map); else map.removeLayer(labelsLayer);
+});
+
+customImageryUrl.value = prefs.get('customUrl') || '';
+customImageryMaxZoom.value = prefs.get('customMaxZoom') || '20';
+const savedImagery = prefs.get('imagery');
+imagerySelect.value = IMAGERY_SOURCES.some(s => s.id === savedImagery) ? savedImagery : 'esri';
+customImagery.style.display = imagerySelect.value === 'custom' ? 'flex' : 'none';
+useImagery(imagerySelect.value);
+if (!imageryLayer) { imagerySelect.value = 'esri'; useImagery('esri'); }
+
 const mapMarkers = [];
 let searchResultMarker = null;
 
@@ -426,11 +565,9 @@ document.getElementById('manualAddBtn').addEventListener('click', () => {
   document.getElementById('manualLon').value = '';
 });
 
-function commitPoint(lat, lon) {
-  const point = { video_xy: state.pendingVideoXY, lat, lon };
-  state.points.push(point);
+function addMapMarker(lat, lon, label) {
   const marker = L.marker([lat, lon], { draggable: true }).addTo(map)
-    .bindTooltip(String(state.points.length), { permanent: true });
+    .bindTooltip(String(label), { permanent: true });
   marker.on('dragend', () => {
     const idx = mapMarkers.indexOf(marker);
     const ll = marker.getLatLng();
@@ -439,6 +576,11 @@ function commitPoint(lat, lon) {
     renderTable();
   });
   mapMarkers.push(marker);
+}
+
+function commitPoint(lat, lon) {
+  state.points.push({ video_xy: state.pendingVideoXY, lat, lon });
+  addMapMarker(lat, lon, state.points.length);
 
   state.pendingVideoXY = null;
   state.awaiting = 'video';
@@ -477,6 +619,7 @@ function renderTable() {
       state.points.splice(idx, 1);
       map.removeLayer(mapMarkers[idx]);
       mapMarkers.splice(idx, 1);
+      mapMarkers.forEach((m, i) => m.setTooltipContent(String(i + 1)));
       if (state.selectedIndex === idx) state.selectedIndex = null;
       redrawMarkers();
       renderTable();
@@ -502,6 +645,10 @@ finishBtn.addEventListener('click', () => {
     site_id: siteId,
     camera_id: cameraId,
     captured_at: new Date().toISOString(),
+    // Provenance: which frame the pixel coordinates refer to, and which aerial
+    // imagery the map clicks were made on (affects achievable accuracy).
+    frame_file: loadedFrameName,
+    map_imagery: currentImagery,
     points: state.points,
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
@@ -510,6 +657,47 @@ finishBtn.addEventListener('click', () => {
   a.download = `${siteId}__${cameraId}__calibration_points.json`;
   a.click();
   setStatus(`Downloaded ${state.points.length}-point calibration for ${siteId} / ${cameraId}. Run homography_middleware.py calibrate-from-points on it.`, true);
+});
+
+// --- Resume from a saved calibration_points.json ---
+// Lets a calibration be corrected point by point (drag a bad one, remove it,
+// add more) instead of redone from scratch.
+document.getElementById('pointsInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  let payload;
+  try {
+    payload = JSON.parse(await file.text());
+  } catch {
+    alert(`${file.name} isn't valid JSON.`);
+    return;
+  }
+  const loaded = (payload.points || []).filter(p =>
+    Array.isArray(p.video_xy) && p.video_xy.length === 2 && Number.isFinite(p.lat) && Number.isFinite(p.lon));
+  if (!loaded.length) { alert(`No calibration points found in ${file.name}.`); return; }
+  if (state.points.length && !confirm(`Replace the ${state.points.length} point(s) currently here with the ${loaded.length} from ${file.name}?`)) return;
+
+  mapMarkers.forEach(m => map.removeLayer(m));
+  mapMarkers.length = 0;
+  state.points = [];
+  state.pendingVideoXY = null;
+  state.selectedIndex = null;
+  state.awaiting = 'video';
+  loaded.forEach(p => {
+    state.points.push({ video_xy: [Math.round(p.video_xy[0]), Math.round(p.video_xy[1])], lat: p.lat, lon: p.lon });
+    addMapMarker(p.lat, p.lon, state.points.length);
+  });
+  if (payload.site_id) document.getElementById('siteId').value = payload.site_id;
+  if (payload.camera_id) document.getElementById('cameraId').value = payload.camera_id;
+  map.fitBounds(L.latLngBounds(state.points.map(p => [p.lat, p.lon])).pad(0.5));
+  if (canvas.width) redrawMarkers();
+  renderTable();
+  refreshStatus();
+  const frameHint = payload.frame_file ? ` It was made on frame "${payload.frame_file}".` : '';
+  setStatus(`Loaded ${state.points.length} points from ${file.name}.${frameHint} ` +
+    (canvas.width ? 'Drag any point to adjust it, remove it, or click the frame to add more.'
+                  : 'Now load the matching frame to see them on the image.'));
+  e.target.value = '';
 });
 
 refreshStatus();
