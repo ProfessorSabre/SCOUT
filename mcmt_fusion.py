@@ -21,8 +21,8 @@ from reid.gallery import (MCMTGallery, DEFAULT_MAX_SPEED_MPS, DEFAULT_OVERLAP_RA
 # What it produces, for one site and one session:
 #   - One Global_ID per real person across every camera (reid/gallery.py),
 #     with each person's travel mode on every row: on foot, or riding a
-#     bicycle / scooter / skateboard / wheelchair, decided by whether the
-#     person moves together with one (see associate_modes).
+#     bicycle / scooter / skateboard, decided by whether the person moves
+#     together with one (see associate_modes).
 #   - <camera_id>_fused.csv per camera: the input rows + Global_ID, Confidence
 #     and Mode. The per-camera raw/audit layer.
 #   - full_site_composite.csv: one row per person per time bucket -- where
@@ -100,8 +100,8 @@ MIN_STRANGER_SEPARATION_HEIGHTS = 1.0
 CO_SIGHTING_RADIUS_M = 1.5
 CO_SIGHTING_MIN_SECONDS = 2.0
 
-# Travel mode: a person is riding when they and a bicycle/scooter/skateboard/
-# wheelchair stay within this distance (meters, ground positions) AND move
+# Travel mode: a person is riding when they and a bicycle/scooter/skateboard
+# stay within this distance (meters, ground positions) AND move
 # together: both moving at MIN_SPEED_MPS or more, with velocities (speed and
 # direction, measured over the last second or the track's life so far) within
 # VELOCITY_TOLERANCE_MPS of each other, over a span of at least
@@ -111,7 +111,7 @@ CO_SIGHTING_MIN_SECONDS = 2.0
 # feet being on pedals rather than the ground, which a shallow camera angle
 # stretches. A rider's person box flickers on and off (on Founders Square most
 # rider person tracks lasted under a second), hence the short history and span.
-RIDEABLE_CLASSES = {"bicycle", "scooter", "skateboard", "wheelchair"}
+RIDEABLE_CLASSES = {"bicycle", "scooter", "skateboard"}
 ASSOCIATION_RADIUS_M = 2.0
 CO_MOVEMENT_WINDOW_S = 1.0
 MIN_MOVEMENT_HISTORY_S = 0.25
@@ -125,6 +125,13 @@ ON_FOOT = "on foot"
 # vehicles, whose ground point shifts more with viewing angle.
 VEHICLE_MERGE_RADIUS_M = {"vehicle": 6.0, "bus": 10.0, "golfcart": 4.0}
 DEFAULT_VEHICLE_MERGE_RADIUS_M = 3.0
+
+# Classes the current model still detects but whose detections aren't reliable
+# enough to report: left out of travel mode, the vehicles file and the counts
+# (they stay in the per-camera fused CSVs, the audit layer). Wheelchair is
+# deferred until it returns with the planned mobility-aids class rebuild; its
+# current detections include hallucinations and bicycle confusion.
+DEFERRED_CLASSES = {"wheelchair"}
 
 DEFAULT_COUNT_INTERVAL_SECONDS = 60.0
 
@@ -417,7 +424,7 @@ def _with_recent_movement(rows: pd.DataFrame) -> pd.DataFrame:
 
 def associate_modes(df: pd.DataFrame) -> tuple[pd.Series, dict]:
     """Mode for every person row (index-aligned with df): ON_FOOT, or the class
-    of the bicycle/scooter/skateboard/wheelchair the person is riding. A person
+    of the bicycle/scooter/skateboard the person is riding. A person
     and a rideable that stay within ASSOCIATION_RADIUS_M and move together for
     at least MIN_ASSOCIATION_S are an associated pair; the person is then
     riding whenever that pair is within the radius -- including stopped at a
@@ -499,7 +506,8 @@ def build_vehicles_csv(df: pd.DataFrame, bucket_seconds: float) -> pd.DataFrame:
     from different cameras in the same moment, within that class's merge
     radius, are one vehicle seen twice: the most precise one is kept. Two
     detections from the SAME camera are always two vehicles."""
-    rows = df[(df["Class"] != PERSON_CLASS_NAME) & df["Local_X_Meters"].notna()].copy()
+    rows = df[(df["Class"] != PERSON_CLASS_NAME) & ~df["Class"].isin(DEFERRED_CLASSES)
+              & df["Local_X_Meters"].notna()].copy()
     if rows.empty:
         return rows
     rows["_bucket"] = (rows["Timestamp"] / bucket_seconds).round().astype(int)
