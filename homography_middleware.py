@@ -27,9 +27,10 @@ from pyproj import Transformer
 #                             to catch a bad click.
 #   - calibrate-from-points : ingests >=6 (pixel, lat/lon) correspondences
 #                             from the standalone browser tool
-#                             (scout_calibration.html) and fits via RANSAC,
-#                             which both averages out click imprecision and
-#                             reports a per-point reprojection error.
+#                             (scout_calibration.html), fits a least-squares
+#                             homography over all of them (averaging out click
+#                             imprecision), and reports each point's
+#                             leave-one-out error so a bad click stands out.
 #
 # Local (tape-measure) mode has no absolute frame to anchor to, so it stays
 # on the simple 4-corner path. Global (GPS) mode converts anchors straight to
@@ -38,7 +39,9 @@ from pyproj import Transformer
 # rotation correction needed. Multi-camera fusion at a single site requires
 # global mode: local mode gives each camera its own private, unrelated
 # origin, so only global mode puts every camera's output in one shared
-# real-world coordinate frame.
+# real-world coordinate frame. In global mode, Local_X/Y_Meters are meters
+# east/north of one site-wide origin stored in the registry (see
+# site_origin_utm), shared by every camera at the site.
 
 REFERENCE_WINDOW = "SCOUT Calibration"
 CALIBRATION_DIR = Path("calibrations")
@@ -59,6 +62,30 @@ def load_site_registry(site_id: str) -> dict:
 def save_site_registry(site_id: str, registry: dict):
     CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
     registry_path(site_id).write_text(json.dumps(registry, indent=2))
+
+
+# Site-level settings live in the same registry file as the cameras, under a
+# key no camera_id can collide with.
+SITE_KEY = "_site"
+
+
+def camera_entries(registry: dict) -> dict:
+    return {k: v for k, v in registry.items() if not k.startswith("_")}
+
+
+def site_origin_utm(registry: dict) -> list:
+    """The single UTM point every GPS-calibrated camera at a site measures its
+    Local_X/Y_Meters from. It has to be shared: cross-camera matching compares
+    positions from different cameras directly, which only works if they're
+    offsets from the same origin. Registries saved before the site origin
+    existed fall back to their first GPS camera's first point -- exactly what
+    that camera used before, so single-camera output doesn't change."""
+    if SITE_KEY in registry:
+        return registry[SITE_KEY]["origin_utm"]
+    for cal in camera_entries(registry).values():
+        if cal.get("mode") == "global":
+            return cal["utm_coords"][0]
+    raise ValueError("No GPS-calibrated camera in this registry to take a site origin from")
 
 
 # --- Core math ---
@@ -115,29 +142,95 @@ def build_global_calibration_4pt(cam_pixels: list, gps_anchors: list) -> dict:
     }
 
 
-def fit_global_calibration_from_points(pixel_points: list, latlon_points: list) -> dict:
-    """RANSAC-fit path for >=6 (pixel, lat/lon) correspondences from the
-    browser tool. Returns the calibration entry plus a per-point reprojection
-    error report (in meters) so a bad click is visible before it's trusted."""
+def fit_homography(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """Least-squares homography over ALL correspondences -- used both when a
+    calibration is fit and when it's applied in `transform`, so the error
+    report describes exactly the transform that gets used.
+
+    Deliberately not RANSAC. With the handful of hand-clicked points a
+    calibration has (typically 6-10), RANSAC has too little redundancy to
+    separate a bad click from ordinary imprecision: a tight inlier threshold
+    (it was 1 m) can leave a fit resting on the bare 4-point minimum, which
+    matches those four exactly and extrapolates badly everywhere else, while
+    reporting near-zero error on them. A bad click is found instead by
+    leave-one-out error (see fit_global_calibration_from_points) and fixed by
+    the person who made it."""
+    matrix, _ = cv2.findHomography(np.asarray(src, dtype=np.float64), np.asarray(dst, dtype=np.float64), 0)
+    if matrix is None:
+        raise ValueError("Homography fit failed - check for duplicate or collinear points")
+    return matrix
+
+
+def _project(matrix: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    return cv2.perspectiveTransform(np.asarray(pts, dtype=np.float64).reshape(-1, 1, 2), matrix).reshape(-1, 2)
+
+
+def in_front_of_horizon(matrix: np.ndarray, calibration_pixels: np.ndarray, pixels: np.ndarray) -> np.ndarray:
+    """True where a pixel lies below the ground plane's horizon, i.e. could be
+    a point on the ground in front of the camera.
+
+    A homography's third (scale) coordinate changes sign at the horizon line.
+    Every calibration point is on the ground, so its sign marks the valid
+    side. A pixel on the other side -- far-field sky/buildings, or a detection
+    whose "feet" are on a building facade -- has no ground position at all,
+    and projecting it anyway lands it on the opposite side of the camera, often
+    hundreds of meters away. Without this check, those positions would reach
+    cross-camera matching as people who appear to teleport."""
+    scale = lambda px: (np.c_[np.asarray(px, dtype=np.float64), np.ones(len(px))] @ matrix.T)[:, 2]
+    ground_sign = np.sign(np.median(scale(calibration_pixels)))
+    return np.sign(scale(pixels)) == ground_sign
+
+
+# A point is flagged when its leave-one-out error is both well above the
+# calibration's typical point (2x the median) and large in absolute terms
+# (> 2 m) -- the first condition finds the odd one out, the second keeps a
+# uniformly good calibration from flagging its least-good point.
+SUSPECT_LOO_RATIO = 2.0
+SUSPECT_LOO_FLOOR_M = 2.0
+
+
+def fit_global_calibration_from_points(pixel_points: list, latlon_points: list, epsg: int | None = None) -> dict:
+    """Least-squares fit for >=6 (pixel, lat/lon) correspondences from the
+    browser tool. Returns the calibration entry plus a per-point error report
+    in meters, so a bad click is visible before it's trusted.
+
+    Two errors are reported per point:
+      - residual: how far the all-points fit lands from that point. Optimistic,
+        since the point helped shape the fit it's being judged against.
+      - leave-one-out (LOO): fit on every OTHER point, then measure this one.
+        This is the honest per-point check. A high LOO error means either the
+        click pair is wrong, or the point sits where no other point can vouch
+        for it (e.g. alone in a corner of the frame) -- adding points near it
+        tells the two apart."""
     if len(pixel_points) < 6:
-        raise ValueError(f"Need at least 6 point pairs for a RANSAC fit, got {len(pixel_points)}")
+        raise ValueError(f"Need at least 6 point pairs, got {len(pixel_points)}")
     if len(pixel_points) != len(latlon_points):
         raise ValueError("pixel_points and latlon_points must be the same length")
 
     lat0, lon0 = latlon_points[0]
-    epsg = utm_epsg_for(lon0, lat0)
+    epsg = epsg or utm_epsg_for(lon0, lat0)
     to_utm = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
     utm_coords = [list(to_utm.transform(lon, lat)) for lat, lon in latlon_points]
 
-    src = np.array(pixel_points, dtype=np.float32)
-    dst = np.array(utm_coords, dtype=np.float32)
-    matrix, inlier_mask = cv2.findHomography(src, dst, method=cv2.RANSAC, ransacReprojThreshold=1.0)
-    if matrix is None:
-        raise ValueError("Homography fit failed - check for duplicate or collinear points")
+    src = np.array(pixel_points, dtype=np.float64)
+    dst = np.array(utm_coords, dtype=np.float64)
+    matrix = fit_homography(src, dst)
+    residuals = np.linalg.norm(_project(matrix, src) - dst, axis=1)
 
-    reprojected = cv2.perspectiveTransform(src.reshape(-1, 1, 2), matrix).reshape(-1, 2)
-    errors_m = np.linalg.norm(reprojected - dst, axis=1)
-    inliers = inlier_mask.ravel().astype(bool) if inlier_mask is not None else np.ones(len(src), dtype=bool)
+    loo = np.full(len(src), np.nan)
+    for i in range(len(src)):
+        keep = np.arange(len(src)) != i
+        try:
+            loo[i] = np.linalg.norm(_project(fit_homography(src[keep], dst[keep]), src[i:i + 1])[0] - dst[i])
+        except ValueError:
+            pass  # remaining points degenerate without this one; leave NaN
+
+    median_loo = float(np.nanmedian(loo))
+    suspects = [i for i, e in enumerate(loo)
+                if np.isfinite(e) and e > SUSPECT_LOO_RATIO * median_loo and e > SUSPECT_LOO_FLOOR_M]
+
+    def rounded(values):
+        return [None if not np.isfinite(v) else round(float(v), 3) for v in values]
 
     return {
         "mode": "global",
@@ -146,11 +239,14 @@ def fit_global_calibration_from_points(pixel_points: list, latlon_points: list) 
         "utm_epsg": epsg,
         "last_calibrated": date.today().isoformat(),
         "point_count": len(pixel_points),
-        "reprojection_error_m": {
-            "per_point": [round(float(e), 3) for e in errors_m],
-            "mean": round(float(errors_m.mean()), 3),
-            "max": round(float(errors_m.max()), 3),
-            "outlier_points": [i for i, is_in in enumerate(inliers) if not is_in],
+        "fit_method": "least_squares_all_points",
+        "error_m": {
+            "residual_per_point": rounded(residuals),
+            "residual_mean": round(float(residuals.mean()), 3),
+            "loo_per_point": rounded(loo),
+            "loo_median": round(median_loo, 3),
+            "loo_max": round(float(np.nanmax(loo)), 3),
+            "suspect_points": suspects,  # 0-based indices; the browser tool numbers points from 1
         },
     }
 
@@ -239,17 +335,35 @@ def run_calibration_from_points(points_json: str, site_id: str, camera_id: str):
     pixel_points = [p["video_xy"] for p in points]
     latlon_points = [[p["lat"], p["lon"]] for p in points]
 
-    entry = fit_global_calibration_from_points(pixel_points, latlon_points)
-
     registry = load_site_registry(site_id)
+    if SITE_KEY not in registry:
+        existing = [c for c in camera_entries(registry).values() if c.get("mode") == "global"]
+        if existing:
+            registry = {SITE_KEY: {"origin_utm": existing[0]["utm_coords"][0], "utm_epsg": existing[0]["utm_epsg"]}, **registry}
+    site = registry.get(SITE_KEY)
+
+    # Every camera at a site is fit in the site's UTM zone, so a site that
+    # happens to straddle a zone boundary can't end up in two coordinate frames.
+    entry = fit_global_calibration_from_points(pixel_points, latlon_points, epsg=site["utm_epsg"] if site else None)
+
+    if site is None:
+        # First GPS calibration at this site: fix the site origin here, once.
+        # It never moves afterwards, even if this camera is recalibrated.
+        registry = {SITE_KEY: {"origin_utm": entry["utm_coords"][0], "utm_epsg": entry["utm_epsg"]}, **registry}
     registry[camera_id] = entry
     save_site_registry(site_id, registry)
 
-    err = entry["reprojection_error_m"]
+    err = entry["error_m"]
     print(f"Calibrated camera_id='{camera_id}' for site_id='{site_id}' from {entry['point_count']} points")
-    print(f"Reprojection error (meters): mean={err['mean']} max={err['max']}")
-    if err["outlier_points"]:
-        print(f"WARNING: point(s) {err['outlier_points']} flagged as RANSAC outliers - consider re-clicking them")
+    print(f"Leave-one-out error (meters): median={err['loo_median']} max={err['loo_max']}   "
+          f"(fit residual mean={err['residual_mean']})")
+    print("  point  residual_m  leave-one-out_m")
+    for i, (res, loo) in enumerate(zip(err["residual_per_point"], err["loo_per_point"])):
+        flag = "   <-- check this point" if i in err["suspect_points"] else ""
+        print(f"  #{i + 1:<5} {res:>9}  {loo if loo is not None else 'n/a':>15}{flag}")
+    if err["suspect_points"]:
+        print(f"WARNING: point(s) {[i + 1 for i in err['suspect_points']]} (numbered as in the browser tool) disagree with "
+              f"the rest -- either a mismatched click pair, or a point no other point is near enough to vouch for.")
     print(f"Saved to {registry_path(site_id)}")
 
 
@@ -264,10 +378,11 @@ def transform_tracking_csv(tracking_csv: str, site_id: str, output_csv: str, sta
     df = pd.read_csv(tracking_csv)
     for col in ("Local_X_Meters", "Local_Y_Meters", "Longitude", "Latitude"):
         df[col] = np.nan
+    df["Beyond_Horizon"] = False
 
-    unmatched_cameras = set(df["Camera"].unique()) - set(registry.keys())
+    unmatched_cameras = set(df["Camera"].unique()) - set(camera_entries(registry))
 
-    for camera_id, cal in registry.items():
+    for camera_id, cal in camera_entries(registry).items():
         mask = df["Camera"] == camera_id
         if not mask.any():
             continue
@@ -279,24 +394,30 @@ def transform_tracking_csv(tracking_csv: str, site_id: str, output_csv: str, sta
                 print(f"WARNING: camera_id='{camera_id}' calibration is {age_days} days old "
                       f"(calibrated {last_calibrated}) - verify the camera hasn't moved before trusting this run")
 
-        src = np.array(cal["cam_pixels"], dtype=np.float32)
-        dst = np.array(cal["utm_coords"] if cal["mode"] == "global" else cal["site_coords"], dtype=np.float32)
-        matrix, _ = cv2.findHomography(src, dst, method=cv2.RANSAC if len(src) > 4 else 0)
+        src = np.array(cal["cam_pixels"], dtype=np.float64)
+        dst = np.array(cal["utm_coords"] if cal["mode"] == "global" else cal["site_coords"], dtype=np.float64)
+        matrix = fit_homography(src, dst)
 
-        points = df.loc[mask, ["Foot_X", "Foot_Y"]].to_numpy(dtype=np.float32).reshape(-1, 1, 2)
-        transformed = cv2.perspectiveTransform(points, matrix).reshape(-1, 2)
+        foot = df.loc[mask, ["Foot_X", "Foot_Y"]].to_numpy(dtype=np.float64)
+        on_ground = in_front_of_horizon(matrix, src, foot)
+        rows = df.index[mask]
+        df.loc[rows[~on_ground], "Beyond_Horizon"] = True
+        if not on_ground.all():
+            print(f"camera_id='{camera_id}': {(~on_ground).sum():,} of {len(foot):,} rows have their foot point above the "
+                  f"ground plane's horizon -- not on the ground, coordinates left blank (Beyond_Horizon=True)")
+        valid_rows, transformed = rows[on_ground], _project(matrix, foot[on_ground])
 
         if cal["mode"] == "global":
-            origin = dst[0]
-            df.loc[mask, "Local_X_Meters"] = np.round(transformed[:, 0] - origin[0], 2)
-            df.loc[mask, "Local_Y_Meters"] = np.round(transformed[:, 1] - origin[1], 2)
+            origin = site_origin_utm(registry)
+            df.loc[valid_rows, "Local_X_Meters"] = np.round(transformed[:, 0] - origin[0], 2)
+            df.loc[valid_rows, "Local_Y_Meters"] = np.round(transformed[:, 1] - origin[1], 2)
             to_wgs84 = Transformer.from_crs(f"EPSG:{cal['utm_epsg']}", "EPSG:4326", always_xy=True)
             lon, lat = to_wgs84.transform(transformed[:, 0], transformed[:, 1])
-            df.loc[mask, "Longitude"] = np.round(lon, 6)
-            df.loc[mask, "Latitude"] = np.round(lat, 6)
+            df.loc[valid_rows, "Longitude"] = np.round(lon, 6)
+            df.loc[valid_rows, "Latitude"] = np.round(lat, 6)
         else:
-            df.loc[mask, "Local_X_Meters"] = np.round(transformed[:, 0], 2)
-            df.loc[mask, "Local_Y_Meters"] = np.round(transformed[:, 1], 2)
+            df.loc[valid_rows, "Local_X_Meters"] = np.round(transformed[:, 0], 2)
+            df.loc[valid_rows, "Local_Y_Meters"] = np.round(transformed[:, 1], 2)
 
     if unmatched_cameras:
         print(f"Warning: no calibration found for cameras: {sorted(unmatched_cameras)} (rows left blank)")

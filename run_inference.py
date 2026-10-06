@@ -25,9 +25,10 @@ from embedder import PersonEmbedder  # noqa: E402
 # used as a same-session convenience default, matching how it behaved before
 # camera_id existed.
 #
-# --extract-embeddings computes a per-track appearance embedding for the
-# person class only, and saves it to a companion .npz file -- it does NOT
-# assign a Global_ID here. That used to happen inline in this script, but
+# --extract-embeddings computes appearance fingerprints (several per track,
+# see FINGERPRINTS_PER_TRACK) for the person class only, and saves them to a
+# companion .npz file -- it does NOT assign a Global_ID here. Fingerprints are
+# vectors of numbers, not images: no picture of anyone is stored. That used to happen inline in this script, but
 # real cross-camera identity resolution needs real-world coordinates (to
 # check spatial-temporal plausibility and reconcile overlapping cameras),
 # which don't exist until AFTER homography_middleware.py transform runs.
@@ -37,7 +38,18 @@ from embedder import PersonEmbedder  # noqa: E402
 # stage will need -- matching what "all processing happens at the camera"
 # means for the edge deployment target.
 PERSON_CLASS_NAME = "person"
-EMBEDDING_WARMUP_FRAMES = 5  # crops averaged into one embedding per track, to smooth over one bad/occluded frame
+
+# Appearance fingerprints: each person track keeps several, from different
+# moments across the whole track, rather than one averaged from its first few
+# frames. A person seen from behind, then the side, then the front looks
+# different each time; keeping the views separate (instead of blurring them
+# into one average) is what lets a later sighting from any side find its match.
+CROP_SAMPLE_INTERVAL_S = 0.2    # consecutive frames are near-identical; one candidate per 0.2 s per track is plenty
+MAX_CANDIDATES_PER_TRACK = 60   # when exceeded, every other candidate is dropped, keeping even coverage of the whole track
+FINGERPRINTS_PER_TRACK = 20     # stored per track; mcmt_fusion.py decides how many to actually use
+TRACK_END_SECONDS = 3.0         # a track unseen this long is finished: fingerprint it and free its crops (ByteTrack drops lost tracks after ~1 s)
+EDGE_MARGIN_PX = 2              # a box touching the frame edge shows only part of the person
+MAX_OVERLAP_FRACTION = 0.2      # a box this covered by another person's box mixes two people's appearance
 
 
 def get_fps(video_path: Path) -> float:
@@ -75,36 +87,45 @@ def process_video(model: YOLO, video_path: Path, camera_id: str, start_timestamp
     )
 
     rows = []
-    # Per local Track_ID, crops collected until EMBEDDING_WARMUP_FRAMES is
-    # reached, at which point one averaged embedding is computed and stored.
-    # Rows are emitted immediately regardless (no Global_ID to wait for
-    # anymore), unlike the old buffer-until-resolved design.
-    pending_crops = {}
-    embedded_track_ids = set()
+    # Per person track: candidate crops [(timestamp, height_px, crop)], when the
+    # last candidate was taken, and when the track was last seen at all.
+    candidates, last_sampled, last_seen = {}, {}, {}
 
-    def flush_embedding(track_id):
-        crops = pending_crops.pop(track_id)
-        if not crops:
+    def finish_track(track_id):
+        pool = candidates.pop(track_id, [])
+        last_sampled.pop(track_id, None)
+        last_seen.pop(track_id, None)
+        if not pool:
             return
-        vectors = embedder.embed(crops)
-        mean_vector = vectors.mean(axis=0)
-        mean_vector = mean_vector / np.linalg.norm(mean_vector)
-        embedding_records.append({"camera_id": camera_id, "track_id": track_id, "vector": mean_vector})
-        embedded_track_ids.add(track_id)
+        # One fingerprint per stretch of the track (so views vary), each the
+        # largest crop in its stretch (largest = most pixels to compare).
+        bins = np.array_split(np.arange(len(pool)), min(FINGERPRINTS_PER_TRACK, len(pool)))
+        chosen = [pool[max(b, key=lambda i: pool[i][1])] for b in bins if len(b)]
+        vectors = embedder.embed([crop for _, _, crop in chosen])
+        for (ts, height, _), vector in zip(chosen, vectors):
+            embedding_records.append({"camera_id": camera_id, "track_id": track_id, "timestamp": ts,
+                                      "height_px": height, "vector": vector})
 
     for frame_idx, result in enumerate(results):
         if max_frames is not None and frame_idx >= max_frames:
             break
 
+        timestamp = round(start_timestamp + frame_idx / fps, 2)
+        if embeddings_enabled:
+            for track_id in [t for t, seen in last_seen.items() if timestamp - seen > TRACK_END_SECONDS]:
+                finish_track(track_id)
+
         boxes = result.boxes
         if boxes is None or boxes.id is None:
             continue
 
-        timestamp = round(start_timestamp + frame_idx / fps, 2)
         xyxy = boxes.xyxy.cpu().numpy()
         track_ids = boxes.id.int().cpu().tolist()
         class_ids = boxes.cls.int().cpu().tolist()
         frame = result.orig_img if embeddings_enabled else None
+        if embeddings_enabled:
+            frame_h, frame_w = frame.shape[:2]
+            person_boxes = xyxy[[model.names[c] == PERSON_CLASS_NAME for c in class_ids]]
 
         for (x1, y1, x2, y2), track_id, cls_id in zip(xyxy, track_ids, class_ids):
             class_name = model.names[cls_id]
@@ -122,19 +143,31 @@ def process_video(model: YOLO, video_path: Path, camera_id: str, start_timestamp
                 "Foot_Y": round(float(y2), 1),
             })
 
-            if embeddings_enabled and class_name == PERSON_CLASS_NAME and track_id not in embedded_track_ids:
-                crops = pending_crops.setdefault(track_id, [])
-                if len(crops) < EMBEDDING_WARMUP_FRAMES:
-                    crop = frame[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)]
-                    if crop.size > 0:
-                        crops.append(crop)
-                    if len(crops) >= EMBEDDING_WARMUP_FRAMES:
-                        flush_embedding(track_id)
+            if embeddings_enabled and class_name == PERSON_CLASS_NAME:
+                last_seen[track_id] = timestamp
+                if timestamp - last_sampled.get(track_id, -np.inf) < CROP_SAMPLE_INTERVAL_S:
+                    continue
+                if x1 <= EDGE_MARGIN_PX or y1 <= EDGE_MARGIN_PX or x2 >= frame_w - EDGE_MARGIN_PX or y2 >= frame_h - EDGE_MARGIN_PX:
+                    continue
+                area = max((x2 - x1) * (y2 - y1), 1.0)
+                ix = np.clip(np.minimum(x2, person_boxes[:, 2]) - np.maximum(x1, person_boxes[:, 0]), 0, None)
+                iy = np.clip(np.minimum(y2, person_boxes[:, 3]) - np.maximum(y1, person_boxes[:, 1]), 0, None)
+                overlap = ix * iy / area
+                overlap[np.argmax(overlap)] = 0.0  # this box's overlap with itself (1.0)
+                if overlap.max(initial=0.0) > MAX_OVERLAP_FRACTION:
+                    continue
+                crop = frame[int(y1):int(y2), int(x1):int(x2)]
+                if crop.size == 0:
+                    continue
+                pool = candidates.setdefault(track_id, [])
+                pool.append((timestamp, float(y2 - y1), crop.copy()))
+                last_sampled[track_id] = timestamp
+                if len(pool) > MAX_CANDIDATES_PER_TRACK:
+                    candidates[track_id] = pool[::2]
 
-    # Any person tracks still warming up when the video ended: embed with
-    # whatever crops they did accumulate (even just one) rather than drop them.
-    for track_id in list(pending_crops.keys()):
-        flush_embedding(track_id)
+    # Tracks still open when the video ends are finished with whatever they have.
+    for track_id in list(last_seen):
+        finish_track(track_id)
 
     return rows
 
@@ -142,7 +175,7 @@ def process_video(model: YOLO, video_path: Path, camera_id: str, start_timestamp
 def main():
     parser = argparse.ArgumentParser(description="SCOUT Phase 1: ByteTrack inference -> CSV telemetry")
     parser.add_argument("--weights", default="weights/best.pt")
-    parser.add_argument("--source", default="videos", help="Directory of .mp4/.avi/.mov videos, or a single video file")
+    parser.add_argument("--source", default="videos/sdd_videos", help="Directory of .mp4/.avi/.mov videos, or a single video file")
     parser.add_argument("--output-dir", default="Site_Analyzer_Batch_Runs",
                          help="One <camera_id>_tracking.csv (and, with --extract-embeddings, one <camera_id>_tracking_embeddings.npz) "
                               "is written per camera here -- matching the real deployment architecture where each camera/edge node "
@@ -194,7 +227,8 @@ def main():
         rows_by_camera.setdefault(camera_id, []).extend(rows)
 
     if args.extract_embeddings:
-        print(f"\nExtracted embeddings for {len(embedding_records)} person tracks across this run")
+        n_tracks = len({(r["camera_id"], r["track_id"]) for r in embedding_records})
+        print(f"\nExtracted {len(embedding_records)} appearance fingerprints for {n_tracks} person tracks across this run")
 
     if not rows_by_camera:
         print("\nNo tracking data generated. Check your video files and confidence threshold.")
@@ -213,10 +247,14 @@ def main():
             camera_embeddings = [r for r in embedding_records if r["camera_id"] == camera_id]
             if camera_embeddings:
                 embeddings_path = output_dir / f"{camera_id}_tracking_embeddings.npz"
+                # One row per fingerprint (several per track): which track, when it
+                # was taken, how tall the person was in pixels, and the vector.
                 np.savez(
                     embeddings_path,
                     camera_ids=np.array([r["camera_id"] for r in camera_embeddings]),
                     track_ids=np.array([r["track_id"] for r in camera_embeddings]),
+                    timestamps=np.array([r["timestamp"] for r in camera_embeddings]),
+                    heights_px=np.array([r["height_px"] for r in camera_embeddings]),
                     vectors=np.stack([r["vector"] for r in camera_embeddings]),
                 )
                 print(f"Camera '{camera_id}': embeddings saved to {embeddings_path}")
