@@ -399,12 +399,19 @@ def transform_tracking_csv(tracking_csv: str, site_id: str, output_csv: str, sta
         matrix = fit_homography(src, dst)
 
         foot = df.loc[mask, ["Foot_X", "Foot_Y"]].to_numpy(dtype=np.float64)
-        on_ground = in_front_of_horizon(matrix, src, foot)
+        # Blank pixels come from run_inference.py stretches that couldn't be
+        # aligned to the camera's reference frame: no position, but not
+        # beyond the horizon either.
+        has_pixels = ~np.isnan(foot).any(axis=1)
+        on_ground = has_pixels & in_front_of_horizon(matrix, src, foot)
         rows = df.index[mask]
-        df.loc[rows[~on_ground], "Beyond_Horizon"] = True
-        if not on_ground.all():
-            print(f"camera_id='{camera_id}': {(~on_ground).sum():,} of {len(foot):,} rows have their foot point above the "
+        beyond = has_pixels & ~on_ground
+        df.loc[rows[beyond], "Beyond_Horizon"] = True
+        if beyond.any():
+            print(f"camera_id='{camera_id}': {beyond.sum():,} of {len(foot):,} rows have their foot point above the "
                   f"ground plane's horizon -- not on the ground, coordinates left blank (Beyond_Horizon=True)")
+        if not has_pixels.all():
+            print(f"camera_id='{camera_id}': {(~has_pixels).sum():,} rows have no pixel position (unaligned frames) -- left blank")
         valid_rows, transformed = rows[on_ground], _project(matrix, foot[on_ground])
 
         if cal["mode"] == "global":

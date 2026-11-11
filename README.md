@@ -8,7 +8,7 @@ SCOUT is an **observation tool**, not a simulator. It answers "what actually hap
 
 ## What it does
 
-1. **Detect & track** (`run_inference.py`) — a fine-tuned YOLOv11 model detects people and micro-mobility classes in video; Ultralytics' built-in ByteTrack keeps a persistent ID per object within one camera's view. Optionally extracts up to 20 appearance fingerprints per person track (numeric vectors from the clearest views across the track; no image of anyone is ever written to disk).
+1. **Detect & track** (`run_inference.py`) — a fine-tuned YOLOv11 model detects people and micro-mobility classes in video; Ultralytics' built-in ByteTrack keeps a persistent ID per object within one camera's view. A detection needs 0.35 confidence to start a track, but weaker detections (down to 0.10) may extend an existing one, so a person partly hidden for a few frames isn't split into separate tracks; a lost track is held for 2 s at any frame rate. Optionally extracts up to 20 appearance fingerprints per person track (numeric vectors from the clearest views across the track; no image of anyone is ever written to disk). A camera that drifts (a propped phone, a pole in wind) can be aligned, frame by frame, to the still image it was calibrated on (`frame_alignment.py`).
 2. **Calibrate & georeference** (`homography_middleware.py`, `scout_calibration.html`) — a least-squares homography fit over 6+ real-world reference points converts pixel coordinates to real-world meters and GPS coordinates, reporting each point's leave-one-out error in meters so a bad click is visible. The browser-based calibration tool (`scout_calibration.html`) is a single self-contained HTML file — no backend, no install — for clicking video-frame (or still-image) points against a choice of aerial imagery. Detections above the ground plane's horizon get no coordinates rather than impossible ones.
 3. **Fuse the site** (`mcmt_fusion.py`) — works with one camera or many. Resolves one identity per person across the site: by ground position where camera views overlap, and by appearance plus physical plausibility (nobody moves faster than 15 m/s) elsewhere, solved as a batch assignment problem rather than greedy matching. The appearance threshold is calibrated by every run from pairs of people it knows are different, per hour of footage. Also attributes travel mode (on foot, or riding a bicycle/scooter/skateboard, from co-movement), keeps vehicles as anonymous positions, and counts what's present over time. Every run writes a coverage map and a manifest of its settings.
 
@@ -19,6 +19,8 @@ run_inference.py           Detection + tracking, per-camera CSV + embedding outp
 homography_middleware.py   Pixel -> real-world coordinate calibration and transform
 mcmt_fusion.py              Site fusion: identities, travel modes, vehicles, counts
 coverage_map.py            Coverage map (written by every fusion run; also runs standalone)
+frame_alignment.py         Camera-motion compensation: picks each camera's reference still, aligns frames to it
+clock_sync.py              Time offset between two overlapping cameras, from the people both see
 scout_calibration.html     Standalone browser calibration tool (open directly, no server)
 train_master_model.py      YOLOv11 training script
 reid/                      Person re-identification (embedding model + cross-camera gallery)
@@ -35,12 +37,20 @@ See [SETUP.md](SETUP.md) for environment setup (Python version, PyTorch/CUDA ins
 Typical workflow, once set up (the same steps for one camera or many):
 
 ```bash
+# 0. (Cameras that may drift) pick each camera's reference still -- the image to calibrate on --
+#    and name it as "reference_frame" in that camera's camera_map.json entry
+python frame_alignment.py reference --video path/to/cam1.mp4 --output calibrations/reference_frames/your_site/cam1.png
+
 # 1. Detect and track people/objects in each camera's video, extracting appearance fingerprints
 python run_inference.py --source path/to/videos/ --camera-map camera_map.json --extract-embeddings --output-dir out/
 
 # 2. Calibrate each camera once (scout_calibration.html -> calibrate-from-points), then apply it
 python homography_middleware.py calibrate-from-points --points-json calibration_points.json
 python homography_middleware.py transform --tracking-csv out/<camera_id>_tracking.csv --site-id your_site --output out/<camera_id>_movement.csv
+
+# (A recording without a trustworthy start time) find its clock offset against an overlapping camera,
+# then set that camera's start_timestamp in camera_map.json
+python clock_sync.py --reference-csv out/cam1_movement.csv --csv out/cam2_movement.csv
 
 # 3. Fuse the site
 python mcmt_fusion.py --tracking-csvs out/*_movement.csv --embeddings out/*_embeddings.npz --site-id your_site --output-dir out/
@@ -56,6 +66,8 @@ Step 3 writes, into `--output-dir`: `full_site_composite.csv` (one row per perso
 - **Overlap is where hand-off is reliable.** Where camera views overlap, people are handed between cameras by ground position (same spot within 1.5 m for 2+ s), which depends on calibration accuracy, not appearance. Across gaps between views, identity rests on appearance and should be expected to fragment.
 - **Confidence is a first-class output.** Every appearance match carries a similarity/confidence score in the output CSV, not just a bare identity assignment.
 - **Reproducible runs.** The appearance threshold is calibrated per run (per hour of footage) from pairs of people known to be different; `run_manifest.json` records every setting, input and calibrated threshold.
+- **Calibrate on a still, align to it.** A calibration maps one image's pixels to the ground. With a `reference_frame` set, every half second of video is matched to that still on static scene features and detections are converted into its pixels (the as-seen point is kept in `Raw_Foot_X/Y`); stretches that can't be aligned get no position rather than a guessed one. Nothing is cropped, unlike video stabilization.
+- **One clock per site.** Each camera's `start_timestamp` places it on a shared session clock. Where recordings have lost their capture time (messaging apps strip it), `clock_sync.py` recovers the offset from overlap and reports whether the result is reliable; a video joined from several recordings can be given one start time per `segments` entry, and tracks are split at each join.
 - **Camera/site IDs are permanent.** Every physical camera gets a `site_id` + `camera_id` assigned once and never reused after a physical move — recalibrate under a new `camera_id` instead. This is the join key between a camera's saved calibration and every tracking run against it, ever.
 
 ## Known limitations
