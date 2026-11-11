@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from matplotlib.path import Path as Polygon
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial import ConvexHull
 
 from coverage_map import render_coverage_map
@@ -99,6 +100,36 @@ MIN_STRANGER_SEPARATION_HEIGHTS = 1.0
 # radius can't be merged this way reliably -- the run warns about it.
 CO_SIGHTING_RADIUS_M = 1.5
 CO_SIGHTING_MIN_SECONDS = 2.0
+
+# Track stitching within one camera. The tracker sometimes loses a person for
+# a moment (a branch, a lamp post, a sun/shade boundary, another pedestrian)
+# and, when it finds them again, gives them a new track ID. On the Bell Tower
+# footage 8-26% of person tracks started within 1 s and 40 px of where another
+# had just ended. A track is stitched to one that ended at most
+# STITCH_MAX_GAP_S earlier in the same camera if it starts where the earlier
+# track was heading: the earlier track's last position carried forward at its
+# recent velocity (a constant-velocity prediction, the same assumption the
+# tracker's own motion model makes), within STITCH_BASE_M plus
+# STITCH_SPREAD_MPS per second of gap for turns, stops and position noise.
+# Without a usable velocity (a track shorter than STITCH_MIN_HISTORY_S), the
+# allowance is STITCH_STATIC_SPEED_MPS per second of gap -- a brisk walk.
+# Matching is one-to-one, closest prediction first (Hungarian), and a stitch
+# that would put one identity on two of a camera's tracks at once is refused.
+# Inside a group whose members keep hiding one another, a stitch can attach
+# the wrong member; IDs stay individual and group behavior is left to analysis.
+STITCH_MAX_GAP_S = 1.0
+STITCH_BASE_M = 1.0
+STITCH_SPREAD_MPS = 1.5
+STITCH_STATIC_SPEED_MPS = 3.0
+STITCH_MIN_HISTORY_S = 0.25
+STITCH_VELOCITY_WINDOW_S = 1.0
+
+# Gap filling in the composite: within one Global_ID, a gap of up to
+# STITCH_MAX_GAP_S (plus one time bucket of rounding) between consecutive
+# positions is filled by straight-line interpolation, one row per missing
+# bucket, marked Interpolated=True. Longer gaps are left as gaps: a person
+# missing for longer may have stopped, turned or left. Per-camera fused CSVs
+# are never filled -- they are the record of what each camera actually saw.
 
 # Travel mode: a person is riding when they and a bicycle/scooter/skateboard
 # stay within this distance (meters, ground positions) AND move
@@ -328,6 +359,91 @@ def resolve_global_ids(candidates: list[dict], gallery: MCMTGallery, window_seco
     return resolved
 
 
+def _track_spans(person: pd.DataFrame) -> pd.DataFrame:
+    return person.groupby([person["Camera"], person["Track_ID"].astype(int)])["Timestamp"].agg(["min", "max"])
+
+
+def _identity_members(resolved: dict) -> dict:
+    members = {}
+    for key, r in resolved.items():
+        members.setdefault(r["global_id"], set()).add(key)
+    return members
+
+
+def _same_camera_conflict(group_a: set, group_b: set, spans: pd.DataFrame) -> bool:
+    """True if merging the two identities would put one identity on two of a
+    camera's tracks at the same moment."""
+    for ka in group_a:
+        for kb in group_b:
+            if ka[0] == kb[0] and ka != kb and ka in spans.index and kb in spans.index:
+                (a0, a1), (b0, b1) = spans.loc[ka], spans.loc[kb]
+                if a0 <= b1 and b0 <= a1:
+                    return True
+    return False
+
+
+def _merge_identities(resolved: dict, members: dict, gid_a: str, gid_b: str):
+    keep, drop = sorted([gid_a, gid_b], key=lambda g: int(g.rsplit("_", 1)[-1]))
+    for key in members.pop(drop):
+        resolved[key]["global_id"] = keep
+        members[keep].add(key)
+
+
+def stitch_track_breaks(df: pd.DataFrame, resolved: dict) -> dict:
+    """Within each camera, gives a track the identity of the track it
+    continues after a brief loss (see STITCH_*). Updates `resolved` in place;
+    returns the number of stitches per camera."""
+    person = df[(df["Class"] == PERSON_CLASS_NAME) & df["Local_X_Meters"].notna()].sort_values("Timestamp")
+    spans = _track_spans(person)
+    members = _identity_members(resolved)
+    stitched = {}
+    for camera, cam_rows in person.groupby("Camera"):
+        ends, starts = [], []
+        for tid, t in cam_rows.groupby(cam_rows["Track_ID"].astype(int)):
+            ts, xs, ys = t["Timestamp"].to_numpy(), t["Local_X_Meters"].to_numpy(), t["Local_Y_Meters"].to_numpy()
+            recent = ts >= ts[-1] - STITCH_VELOCITY_WINDOW_S
+            span = ts[recent][-1] - ts[recent][0]
+            if span >= STITCH_MIN_HISTORY_S:
+                # Average the first and last fifth of the recent stretch, so one noisy foot point doesn't set the velocity.
+                k = max(1, recent.sum() // 5)
+                rx, ry, rt = xs[recent], ys[recent], ts[recent]
+                velocity = ((rx[-k:].mean() - rx[:k].mean()) / (rt[-k:].mean() - rt[:k].mean()),
+                            (ry[-k:].mean() - ry[:k].mean()) / (rt[-k:].mean() - rt[:k].mean()))
+            else:
+                velocity = None
+            ends.append(((camera, tid), ts[-1], xs[-1], ys[-1], velocity))
+            starts.append(((camera, tid), ts[0], xs[0], ys[0]))
+        if not ends:
+            continue
+        cost = np.full((len(ends), len(starts)), np.inf)
+        for i, (_, t1, x1, y1, v) in enumerate(ends):
+            for j, (_, t0, x0, y0) in enumerate(starts):
+                gap = t0 - t1
+                if not 0 < gap <= STITCH_MAX_GAP_S:
+                    continue
+                if v is not None:
+                    err, allowed = np.hypot(x0 - (x1 + v[0] * gap), y0 - (y1 + v[1] * gap)), STITCH_BASE_M + STITCH_SPREAD_MPS * gap
+                else:
+                    err, allowed = np.hypot(x0 - x1, y0 - y1), STITCH_BASE_M + STITCH_STATIC_SPEED_MPS * gap
+                if err <= allowed:
+                    cost[i, j] = err
+        if not np.isfinite(cost).any():
+            continue
+        rows, cols = linear_sum_assignment(np.where(np.isfinite(cost), cost, 1e9))
+        for i, j in sorted(zip(rows, cols), key=lambda ij: cost[ij]):
+            if not np.isfinite(cost[i, j]):
+                continue
+            ka, kb = ends[i][0], starts[j][0]
+            if ka not in resolved or kb not in resolved:
+                continue
+            gid_a, gid_b = resolved[ka]["global_id"], resolved[kb]["global_id"]
+            if gid_a == gid_b or _same_camera_conflict(members[gid_a], members[gid_b], spans):
+                continue
+            _merge_identities(resolved, members, gid_a, gid_b)
+            stitched[camera] = stitched.get(camera, 0) + 1
+    return stitched
+
+
 def merge_co_sightings(df: pd.DataFrame, resolved: dict, bucket_seconds: float) -> dict:
     """Where cameras overlap, one person standing on one spot of ground at one
     moment is one person, whatever they look like. Two tracks from different
@@ -359,19 +475,8 @@ def merge_co_sightings(df: pd.DataFrame, resolved: dict, bucket_seconds: float) 
             for r in together.itertuples():
                 pairs.append((r.d, -r.n, (cam_a, int(r.Track_ID_a)), (cam_b, int(r.Track_ID_b))))
 
-    spans = person.groupby([person["Camera"], person["Track_ID"].astype(int)])["Timestamp"].agg(["min", "max"])
-    members = {}
-    for key, r in resolved.items():
-        members.setdefault(r["global_id"], set()).add(key)
-
-    def conflicts(group_a, group_b):
-        for ka in group_a:
-            for kb in group_b:
-                if ka[0] == kb[0] and ka != kb and ka in spans.index and kb in spans.index:
-                    (a0, a1), (b0, b1) = spans.loc[ka], spans.loc[kb]
-                    if a0 <= b1 and b0 <= a1:
-                        return True
-        return False
+    spans = _track_spans(person)
+    members = _identity_members(resolved)
 
     partnered = set()
     linked = {}
@@ -380,12 +485,9 @@ def merge_co_sightings(df: pd.DataFrame, resolved: dict, bucket_seconds: float) 
             continue
         gid_a, gid_b = resolved[ka]["global_id"], resolved[kb]["global_id"]
         partnered.update({(ka, kb[0]), (kb, ka[0])})
-        if gid_a == gid_b or conflicts(members[gid_a], members[gid_b]):
+        if gid_a == gid_b or _same_camera_conflict(members[gid_a], members[gid_b], spans):
             continue
-        keep, drop = sorted([gid_a, gid_b], key=lambda g: int(g.rsplit("_", 1)[-1]))
-        for key in members.pop(drop):
-            resolved[key]["global_id"] = keep
-            members[keep].add(key)
+        _merge_identities(resolved, members, gid_a, gid_b)
         label = f"{ka[0]}+{kb[0]}"
         linked[label] = linked.get(label, 0) + 1
     return linked
@@ -492,13 +594,39 @@ def position_precision(df: pd.DataFrame, registry: dict) -> pd.Series:
 
 def build_composite_csv(df: pd.DataFrame, bucket_seconds: float) -> pd.DataFrame:
     """One row per person per time bucket; where several cameras saw that
-    person at once, the most precise view's row is kept."""
+    person at once, the most precise view's row is kept. Short gaps within an
+    identity are then filled (see the gap-filling note at the top)."""
     person = df[(df["Class"] == PERSON_CLASS_NAME) & df["Global_ID"].notna() & df["Local_X_Meters"].notna()].copy()
     if person.empty:
-        return person
+        return person.assign(Interpolated=pd.Series(dtype=bool))
     person["_bucket"] = (person["Timestamp"] / bucket_seconds).round().astype(int)
     person = person.sort_values("_precision", ascending=False).drop_duplicates(["Global_ID", "_bucket"], keep="first")
-    return person.drop(columns=["_bucket"]).sort_values(["Global_ID", "Timestamp"])
+    person = person.sort_values(["Global_ID", "_bucket"])
+    person["Interpolated"] = False
+
+    max_step = int(round((STITCH_MAX_GAP_S + bucket_seconds) / bucket_seconds))
+    prev = person.shift(1)
+    step = person["_bucket"] - prev["_bucket"]
+    fill_at = person.index[(person["Global_ID"] == prev["Global_ID"]) & (step > 1) & (step <= max_step)]
+    pixel_cols = [c for c in ("Center_X", "Center_Y", "Foot_X", "Foot_Y", "Raw_Foot_X", "Raw_Foot_Y", "Detection_Conf") if c in person.columns]
+    filled = []
+    for idx in fill_at:
+        after = person.loc[idx]
+        before = prev.loc[idx]
+        for b in range(int(before["_bucket"]) + 1, int(after["_bucket"])):
+            w = (b - before["_bucket"]) / (after["_bucket"] - before["_bucket"])
+            row = before.copy()   # identity, camera, class and mode carried from the last real position
+            row["_bucket"] = b
+            row["Timestamp"] = round(b * bucket_seconds, 2)
+            for c in ("Local_X_Meters", "Local_Y_Meters", "Longitude", "Latitude"):
+                row[c] = before[c] + w * (after[c] - before[c])
+            for c in pixel_cols:
+                row[c] = np.nan   # no camera saw this position
+            row["Interpolated"] = True
+            filled.append(row)
+    if filled:
+        person = pd.concat([person, pd.DataFrame(filled)], ignore_index=True)
+    return person.drop(columns=["_bucket"]).sort_values(["Global_ID", "Timestamp"]).reset_index(drop=True)
 
 
 def build_vehicles_csv(df: pd.DataFrame, bucket_seconds: float) -> pd.DataFrame:
@@ -641,6 +769,10 @@ def main():
     resolved = resolve_global_ids(candidates, gallery, args.window_seconds)
     print(f"Resolved {len(candidates)} tracks into {len({r['global_id'] for r in resolved.values()})} Global_IDs "
           f"({len(gallery.global_ids)} of them from appearance-matched tracks)")
+    stitches = stitch_track_breaks(df, resolved)
+    print(f"Track breaks stitched within a camera (gap <= {STITCH_MAX_GAP_S:g} s, where the earlier track was heading): "
+          + (", ".join(f"{k}: {v}" for k, v in sorted(stitches.items())) or "none")
+          + f"; {len({r['global_id'] for r in resolved.values()})} Global_IDs after")
     co_sightings = merge_co_sightings(df, resolved, args.bucket_seconds)
     print(f"Overlap hand-offs by position (same ground within {CO_SIGHTING_RADIUS_M:g} m for {CO_SIGHTING_MIN_SECONDS:g}+ s): "
           + (", ".join(f"{k}: {v}" for k, v in sorted(co_sightings.items())) or "none")
@@ -681,7 +813,8 @@ def main():
     vehicles.to_csv(site_dir / "full_site_vehicles.csv", index=False)
     counts = build_counts_csv(composite, vehicles, df["Timestamp"].min(), df["Timestamp"].max(), args.bucket_seconds, args.count_interval_seconds)
     counts.to_csv(site_dir / "counts_over_time.csv", index=False)
-    print(f"Site outputs written to {site_dir}: composite ({len(composite):,} rows), vehicles ({len(vehicles):,} rows), counts_over_time")
+    print(f"Site outputs written to {site_dir}: composite ({len(composite):,} rows, {int(composite['Interpolated'].sum()):,} of them "
+          f"interpolated across gaps <= {STITCH_MAX_GAP_S:g} s), vehicles ({len(vehicles):,} rows), counts_over_time")
 
     areas = render_coverage_map({c: g for c, g in df.groupby("Camera")}, args.site_id, site_dir / "coverage_map.png", args.basemap)
     print("Coverage map: " + "  ".join(f"{k}: {v:,.0f} sq m" for k, v in areas.items()))
@@ -697,9 +830,9 @@ def main():
             "person_tracks": len(candidates), "appearance_matched_tracks": n_eligible,
             "global_ids": len({r["global_id"] for r in resolved.values()}),
             "global_ids_from_appearance_matching": len(gallery.global_ids),
-            "overlap_handoffs_by_position": co_sightings, "cameras_too_loosely_calibrated_for_position_handoff": loose,
+            "track_breaks_stitched": stitches, "overlap_handoffs_by_position": co_sightings, "cameras_too_loosely_calibrated_for_position_handoff": loose,
             "same_camera_duplicates": duplicates, "travel_mode": mode_stats, "person_rows_riding": riding_rows,
-            "composite_rows": len(composite), "vehicle_rows": len(vehicles),
+            "composite_rows": len(composite), "composite_rows_interpolated": int(composite["Interpolated"].sum()), "vehicle_rows": len(vehicles),
             "coverage_sq_m": {k: round(v) for k, v in areas.items()},
         },
         "outputs": [str(p) for p in [args.composite_output, site_dir / "full_site_vehicles.csv", site_dir / "counts_over_time.csv",

@@ -28,6 +28,7 @@ weights/                   Trained detection model weights (best.pt)
 calibrations/              Per-site calibration registry (includes a real worked example)
 datasets/PBED/             Training dataset config (images sourced separately, see its README)
 frame_extraction_tools/    Video-to-frames utilities for building/expanding training data
+tests/                     Synthetic checks for every stage (python tests/run_all.py)
 ```
 
 ## Getting started
@@ -64,6 +65,7 @@ Step 3 writes, into `--output-dir`: `full_site_composite.csv` (one row per perso
 - **Person-only identity.** Re-identification is scoped to the `person` class. Bicycles, vehicles, etc. are kept as anonymous positions over time (a vehicle seen by two overlapping cameras at once is kept once) plus counts per interval, never an identity, and no image content such as license plates is retained. A person's travel mode is attributed to the person: within 2 m of a bicycle/scooter/skateboard and moving with it at matching speed and direction means riding it. There are no speed categories.
 - **Zero-PII by construction.** Appearance fingerprints are numeric vectors computed in memory; no frame or crop of a person is written to disk.
 - **Overlap is where hand-off is reliable.** Where camera views overlap, people are handed between cameras by ground position (same spot within 1.5 m for 2+ s), which depends on calibration accuracy, not appearance. Across gaps between views, identity rests on appearance and should be expected to fragment.
+- **Brief losses are stitched; IDs stay individual.** When the tracker loses a person for a moment (a branch, a post, a sun/shade boundary) and gives them a new track ID, the fusion stage joins the two if the new track starts within 1 s where the earlier one was heading (a constant-velocity prediction), one-to-one. In `full_site_composite.csv`, gaps of up to 1 s within an identity are filled by straight-line interpolation and marked `Interpolated=True`; per-camera files are never filled. Every Global_ID is one individual -- group behavior is left to analysis of the paths.
 - **Confidence is a first-class output.** Every appearance match carries a similarity/confidence score in the output CSV, not just a bare identity assignment.
 - **Reproducible runs.** The appearance threshold is calibrated per run (per hour of footage) from pairs of people known to be different; `run_manifest.json` records every setting, input and calibrated threshold.
 - **Calibrate on a still, align to it.** A calibration maps one image's pixels to the ground. With a `reference_frame` set, every half second of video is matched to that still on static scene features and detections are converted into its pixels (the as-seen point is kept in `Raw_Foot_X/Y`); stretches that can't be aligned get no position rather than a guessed one. Nothing is cropped, unlike video stabilization.
@@ -72,9 +74,10 @@ Step 3 writes, into `--output-dir`: `full_site_composite.csv` (one row per perso
 
 ## Known limitations
 
-- Cross-camera fusion has been tested on one real three-camera recording (handheld phones, farther away and at shallower angles than the deployment spec). There, position-based hand-off worked between well-calibrated overlapping cameras, but appearance did not distinguish the same person seen from a second camera from a stranger, so identity across gaps between views is not yet reliable. Missed matches have not been measured against hand-traced ground truth.
+- Cross-camera fusion has been tested on two real multi-camera recordings made with phones (three cameras at one site, four at another). Position-based hand-off worked between well-calibrated overlapping cameras; appearance did not reliably distinguish the same person seen from a second camera from a stranger, so identity across gaps between views is not yet reliable. Neither recording had walkers of known identity, so accuracy has not been measured against ground truth.
+- Inside a group whose members keep hiding one another from a single viewpoint, identities can swap when the group separates; group paths and counts are largely unaffected, individual dwell and route measures are where groups split.
 - People less than 60 px tall aren't matched on appearance (there isn't enough pixel information for any embedding model); they're kept and counted in every output, unflagged, but each track gets its own identity.
-- Riders seen from above are often detected only as the bicycle/scooter, so travel mode undercounts riders until the detector is retrained with riders labeled as people.
+- Travel mode needs both the rider and the vehicle detected. The current detector finds bicycles seen side-on well but often misses them ridden straight toward or away from the camera (on one test, a rider's bicycle was detected in 17-49% of the frames where the rider was), so travel mode undercounts riding until the detector is retrained with more head-on and tail-on examples.
 - The `wheelchair` detection class is known to be weak (confirmed hallucinations and confusion with bicycles) and is being rebuilt from better training data. Until then `mcmt_fusion.py` leaves it out of travel mode, the vehicles file and the counts (`DEFERRED_CLASSES`); raw detections stay in the per-camera fused CSVs.
 - No edge-deployment (Jetson-class hardware, live camera feeds, network publishing) code exists yet — this repo is the core detection/tracking/calibration/fusion pipeline, run as batch processing over recorded video.
 
