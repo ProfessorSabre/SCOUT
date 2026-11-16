@@ -51,7 +51,8 @@ python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
 
 ## 6. Model weights
 
-- **`weights/best.pt`** — the trained YOLOv11 detection model — is already included in this repo (see `weights/README.md`).
+- **`yolo11m.pt`** — the default detection model (stock YOLOv11m) — is downloaded automatically by Ultralytics the first time `run_inference.py` runs (about 39 MB, needs internet access once).
+- **`weights/best.pt`** — the project's own fine-tuned YOLOv11s model, with scooter and golf-cart classes — is included in this repo (see `weights/README.md`); use it with `--weights weights/best.pt`.
 - **`reid/weights/osnet_ain_x1_0_msmt17.pth`** — the Re-ID embedding model — is **not** included (third-party checkpoint, redistribution terms unverified). Only needed if you're using cross-camera identity (`--extract-embeddings` / `mcmt_fusion.py`); detection and tracking alone work without it. See `reid/weights/DOWNLOAD_WEIGHTS.md` for the exact file and source to download.
 
 ## 7. Quick smoke test
