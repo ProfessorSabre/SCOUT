@@ -101,6 +101,16 @@ MIN_STRANGER_SEPARATION_HEIGHTS = 1.0
 CO_SIGHTING_RADIUS_M = 1.5
 CO_SIGHTING_MIN_SECONDS = 2.0
 
+# One identity, one place at a time: two tracks of one Global_ID in different
+# cameras at the same moments whose ground positions (median over their shared
+# 0.5 s buckets) are farther apart than this can't be one person. 5 m is well
+# above the calibration error of any camera used so far (leave-one-out medians
+# 0.2-1.7 m) and above the 1.5 m within which overlapping cameras hand people
+# off. Merges join whole identities, so such a conflict can arise when an
+# identity that already holds a track in a third camera is merged; see
+# resolve_simultaneous_conflicts for which track keeps the identity.
+CONFLICT_RADIUS_M = 5.0
+
 # Track stitching within one camera. The tracker sometimes loses a person for
 # a moment (a branch, a lamp post, a sun/shade boundary, another pedestrian)
 # and, when it finds them again, gives them a new track ID. On the Bell Tower
@@ -142,7 +152,7 @@ STITCH_VELOCITY_WINDOW_S = 1.0
 # feet being on pedals rather than the ground, which a shallow camera angle
 # stretches. A rider's person box flickers on and off (on Founders Square most
 # rider person tracks lasted under a second), hence the short history and span.
-RIDEABLE_CLASSES = {"bicycle", "scooter", "skateboard"}
+RIDEABLE_CLASSES = {"bicycle", "scooter", "skateboard", "motorcycle"}
 ASSOCIATION_RADIUS_M = 2.0
 CO_MOVEMENT_WINDOW_S = 1.0
 MIN_MOVEMENT_HISTORY_S = 0.25
@@ -154,7 +164,8 @@ ON_FOOT = "on foot"
 # Two detections of the same vehicle class from DIFFERENT cameras at the same
 # moment, closer than this, are one vehicle seen twice. Bigger for larger
 # vehicles, whose ground point shifts more with viewing angle.
-VEHICLE_MERGE_RADIUS_M = {"vehicle": 6.0, "bus": 10.0, "golfcart": 4.0}
+# car/truck/motorcycle are the stock COCO model's names (default detector since 2026-11-16).
+VEHICLE_MERGE_RADIUS_M = {"vehicle": 6.0, "car": 6.0, "truck": 8.0, "bus": 10.0, "golfcart": 4.0}
 DEFAULT_VEHICLE_MERGE_RADIUS_M = 3.0
 
 # Classes the current model still detects but whose detections aren't reliable
@@ -524,6 +535,93 @@ def _with_recent_movement(rows: pd.DataFrame) -> pd.DataFrame:
     return rows.drop(columns=["_t_back", "_t_past", "_x_past", "_y_past"])
 
 
+def resolve_simultaneous_conflicts(df: pd.DataFrame, resolved: dict, bucket_seconds: float, mint_id,
+                                   max_speed_mps: float = DEFAULT_MAX_SPEED_MPS,
+                                   slack_m: float = DEFAULT_OVERLAP_RADIUS_METERS) -> dict:
+    """Where one Global_ID is in two cameras at the same moment, more than
+    CONFLICT_RADIUS_M apart, one of the two tracks loses the identity and gets
+    a new Global_ID of its own (with the tracks stitched to it in its camera).
+
+    Which one (the PI's rule, 2026-11-16): the track with the lower confidence
+    loses it, unless the higher-confidence track can't be reached from where
+    the identity was last seen before the conflict (more than slack_m +
+    max_speed_mps x elapsed time away) while the lower-confidence one can --
+    then the higher-confidence one loses it. Confidence is the track's
+    appearance-match score; a track without one is the identity's first
+    sighting or was joined by position (stitch or overlap hand-off), and counts
+    as certain (1.0). On a tie the track that started first keeps it.
+    Conflicts are settled earliest first, re-checking after each one.
+    Updates `resolved` in place; returns counts."""
+    person = df[(df["Class"] == PERSON_CLASS_NAME) & df["Local_X_Meters"].notna()].copy()
+    person["Track_ID"] = person["Track_ID"].astype(int)
+    person["Bucket"] = (person["Timestamp"] / bucket_seconds).round().astype(int)
+    pos = person.groupby(["Camera", "Track_ID", "Bucket"])[["Local_X_Meters", "Local_Y_Meters"]].mean().reset_index()
+    pos["key"] = list(zip(pos["Camera"], pos["Track_ID"]))
+    pos = pos[pos["key"].isin(resolved.keys())]
+    spans = _track_spans(person)
+    counts = {"tracks_detached": 0, "kept_higher_confidence": 0, "kept_reachable": 0}
+
+    def score(key):
+        c = resolved[key]["confidence"]
+        return 1.0 if c is None or pd.isna(c) else float(c)
+
+    def stitch_chain(key, group):
+        """key plus the same-camera members joined to it across gaps <= STITCH_MAX_GAP_S."""
+        same = sorted((k for k in group if k[0] == key[0] and k in spans.index), key=lambda k: spans.loc[k, "min"])
+        chain, changed = {key}, True
+        while changed:
+            changed = False
+            for k in same:
+                if k in chain:
+                    continue
+                if any(abs(spans.loc[k, "min"] - spans.loc[c, "max"]) <= STITCH_MAX_GAP_S
+                       or abs(spans.loc[c, "min"] - spans.loc[k, "max"]) <= STITCH_MAX_GAP_S for c in chain):
+                    chain.add(k)
+                    changed = True
+        return chain
+
+    for _ in range(10000):
+        pos["gid"] = [resolved[k]["global_id"] for k in pos["key"]]
+        m = pos.merge(pos, on=["gid", "Bucket"], suffixes=("_a", "_b"))
+        m = m[m["Camera_a"] < m["Camera_b"]]
+        if m.empty:
+            break
+        m["d"] = np.hypot(m["Local_X_Meters_a"] - m["Local_X_Meters_b"], m["Local_Y_Meters_a"] - m["Local_Y_Meters_b"])
+        pairs = m.groupby(["key_a", "key_b"]).agg(gid=("gid", "first"), d=("d", "median"), start=("Bucket", "min")).reset_index()
+        pairs = pairs[pairs["d"] > CONFLICT_RADIUS_M]
+        if pairs.empty:
+            break
+        first = pairs.sort_values(["start", "key_a", "key_b"]).iloc[0]
+        ka, kb, gid = first["key_a"], first["key_b"], first["gid"]
+        t_conflict = first["start"] * bucket_seconds
+        hi, lo = sorted([ka, kb], key=lambda k: (-score(k), spans.loc[k, "min"]))
+
+        # Where the identity was last seen before the conflict began, by any other member.
+        others = pos[(pos["gid"] == gid) & ~pos["key"].isin([ka, kb]) & (pos["Bucket"] < first["start"])]
+        detach = lo
+        if not others.empty:
+            last = others.loc[others["Bucket"].idxmax()]
+
+            def reachable(key):
+                own = pos[(pos["key"] == key) & (pos["Bucket"] >= last["Bucket"])]
+                if own.empty:
+                    return True
+                here = own.loc[own["Bucket"].idxmin()]
+                dt = (here["Bucket"] - last["Bucket"]) * bucket_seconds
+                return np.hypot(here["Local_X_Meters"] - last["Local_X_Meters"],
+                                here["Local_Y_Meters"] - last["Local_Y_Meters"]) <= slack_m + max_speed_mps * dt
+            if not reachable(hi) and reachable(lo):
+                detach = hi
+        counts["kept_reachable" if detach == hi else "kept_higher_confidence"] += 1
+
+        group = {k for k, r in resolved.items() if r["global_id"] == gid}
+        new_id = mint_id()
+        for key in stitch_chain(detach, group - {hi if detach == lo else lo}):
+            resolved[key] = {"global_id": new_id, "confidence": None}
+            counts["tracks_detached"] += 1
+    return counts
+
+
 def associate_modes(df: pd.DataFrame) -> tuple[pd.Series, dict]:
     """Mode for every person row (index-aligned with df): ON_FOOT, or the class
     of the bicycle/scooter/skateboard the person is riding. A person
@@ -777,6 +875,13 @@ def main():
     print(f"Overlap hand-offs by position (same ground within {CO_SIGHTING_RADIUS_M:g} m for {CO_SIGHTING_MIN_SECONDS:g}+ s): "
           + (", ".join(f"{k}: {v}" for k, v in sorted(co_sightings.items())) or "none")
           + f"; {len({r['global_id'] for r in resolved.values()})} Global_IDs after")
+    conflicts = resolve_simultaneous_conflicts(df, resolved, args.bucket_seconds, gallery.mint_unlinked_id,
+                                               args.max_speed_mps, args.overlap_radius_meters)
+    print(f"One identity in two places at once (> {CONFLICT_RADIUS_M:g} m apart in different cameras): "
+          f"{conflicts['kept_higher_confidence'] + conflicts['kept_reachable']} conflicts settled "
+          f"({conflicts['kept_higher_confidence']} kept the higher-confidence track, {conflicts['kept_reachable']} the only "
+          f"reachable one), {conflicts['tracks_detached']} tracks given their own Global_ID; "
+          f"{len({r['global_id'] for r in resolved.values()})} Global_IDs after")
     loose = {cam: e["error_m"]["loo_median"] for cam, e in camera_entries(registry).items()
              if cam in set(df["Camera"]) and isinstance(e.get("error_m"), dict)
              and e["error_m"].get("loo_median", 0) > CO_SIGHTING_RADIUS_M / 2}
@@ -792,7 +897,7 @@ def main():
     df["Mode"], mode_stats = associate_modes(df)
     riding_rows = int(((df["Class"] == PERSON_CLASS_NAME) & (df["Mode"] != ON_FOOT)).sum())
     print(f"Travel mode: {mode_stats['rider_associations']} person-rideable pairings found; {riding_rows:,} person rows riding; "
-          f"{mode_stats['moving_rideable_rows_without_rider']:,} moving bicycle/scooter/skateboard rows had no detected rider")
+          f"{mode_stats['moving_rideable_rows_without_rider']:,} moving rideable (bicycle, scooter, skateboard, motorcycle) rows had no detected rider")
 
     duplicates = same_camera_duplicates(df)
     print(f"Same-camera duplicate identities (one Global_ID on two tracks at once): {duplicates}"
@@ -830,7 +935,7 @@ def main():
             "person_tracks": len(candidates), "appearance_matched_tracks": n_eligible,
             "global_ids": len({r["global_id"] for r in resolved.values()}),
             "global_ids_from_appearance_matching": len(gallery.global_ids),
-            "track_breaks_stitched": stitches, "overlap_handoffs_by_position": co_sightings, "cameras_too_loosely_calibrated_for_position_handoff": loose,
+            "track_breaks_stitched": stitches, "overlap_handoffs_by_position": co_sightings, "simultaneous_conflicts": conflicts, "cameras_too_loosely_calibrated_for_position_handoff": loose,
             "same_camera_duplicates": duplicates, "travel_mode": mode_stats, "person_rows_riding": riding_rows,
             "composite_rows": len(composite), "composite_rows_interpolated": int(composite["Interpolated"].sum()), "vehicle_rows": len(vehicles),
             "coverage_sq_m": {k: round(v) for k, v in areas.items()},

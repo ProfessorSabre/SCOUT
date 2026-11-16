@@ -13,6 +13,9 @@ runs/
 # User-supplied input footage -- not shipped with this repo
 videos/
 
+# Stock detection weights Ultralytics downloads on first use
+/yolo11*.pt
+
 # Third-party weights the user must download themselves (see reid/weights/DOWNLOAD_WEIGHTS.md)
 reid/weights/*.pth
 
